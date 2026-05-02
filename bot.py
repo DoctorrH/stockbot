@@ -462,16 +462,12 @@ async def main() -> None:
     # Chế độ chạy 1 lần (phù hợp cho GitHub Actions/Task Scheduler)
     # Set SCAN_ONCE=1 để quét và gửi xong thì thoát.
     scan_once_flag = env_get("SCAN_ONCE", "").lower() in {"1", "true", "yes", "y"}
-    if scan_once_flag:
-        await scan_once_and_send()
-        return
 
-    # Chạy bot Telegram (polling) để nhận lệnh /test
-    app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler("test", cmd_test))
+    # Tạo Application để quản lý lifecycle kết nối Telegram (headless-friendly)
+    application = Application.builder().token(token).build()
+    application.add_handler(CommandHandler("test", cmd_test))
 
-    # Tuỳ chọn: nếu bạn vẫn muốn script tự “push” kết quả quét theo lịch nội bộ
-    # (không cần Task Scheduler), bật DAILY_SCAN_HHMM. Ví dụ: DAILY_SCAN_HHMM=14:25
+    # Tuỳ chọn: chạy quét theo lịch nội bộ (nếu bạn chạy bot 24/7)
     daily_hhmm = env_get("DAILY_SCAN_HHMM", "")
     if daily_hhmm:
         try:
@@ -481,14 +477,33 @@ async def main() -> None:
             async def _job(_: ContextTypes.DEFAULT_TYPE) -> None:
                 await scan_once_and_send()
 
-            app.job_queue.run_daily(_job, time=datetime.now(tz).replace(hour=hh, minute=mm, second=0, microsecond=0).timetz())
+            application.job_queue.run_daily(
+                _job,
+                time=datetime.now(tz).replace(hour=hh, minute=mm, second=0, microsecond=0).timetz(),
+            )
         except Exception:
             pass
 
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    await app.updater.idle()
+    await application.initialize()
+    await application.start()
+    try:
+        if scan_once_flag:
+            # Dành cho GitHub Actions: quét xong là thoát
+            await scan_once_and_send()
+            return
+
+        # Chạy bot Telegram (polling) để nhận lệnh /test
+        if application.updater is None:
+            raise RuntimeError("Updater không khả dụng. Hãy nâng/cài đúng python-telegram-bot.")
+
+        await application.updater.start_polling()
+
+        # Chạy vô hạn cho đến khi bị dừng (Ctrl+C / SIGTERM)
+        await asyncio.Event().wait()
+    finally:
+        # Đóng kết nối an toàn trước khi thoát
+        await application.stop()
+        await application.shutdown()
 
 
 if __name__ == "__main__":
