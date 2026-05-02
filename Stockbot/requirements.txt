@@ -1,0 +1,5 @@
+vnstock
+python-telegram-bot
+python-dotenv
+pandas
+numpy
