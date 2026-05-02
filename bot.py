@@ -1,6 +1,5 @@
 import asyncio
 import os
-import sys
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional
@@ -241,6 +240,35 @@ def safe_get_symbols_with_fallback(exchange: str, sources: List[str]) -> tuple[L
     return [], last_used
 
 
+def safe_get_vn100_symbols(source: str) -> List[str]:
+    listing = Listing(source=source)
+    for attr in ("vn100", "vn100_symbols", "symbols_vn100"):
+        if hasattr(listing, attr):
+            try:
+                data = getattr(listing, attr)()
+                if isinstance(data, (list, tuple, pd.Series)):
+                    return [str(s).strip().upper() for s in data if str(s).strip()]
+                if isinstance(data, pd.DataFrame):
+                    cols = {c.lower(): c for c in data.columns}
+                    sym_col = cols.get("symbol") or cols.get("ticker") or cols.get("code")
+                    if sym_col:
+                        return [str(s).strip().upper() for s in data[sym_col].tolist() if str(s).strip()]
+            except Exception:
+                pass
+    return []
+
+
+def safe_get_vn100_symbols_with_fallback(sources: List[str]) -> tuple[List[str], Optional[str]]:
+    for src in sources:
+        try:
+            symbols = safe_get_vn100_symbols(src)
+            if symbols:
+                return symbols, src
+        except Exception:
+            continue
+    return [], None
+
+
 def load_history(symbol: str, source: str, length: int) -> pd.DataFrame:
     """
     Lấy OHLCV theo ngày cho 1 mã. Dùng length (số phiên lùi lại) để tránh phụ thuộc ngày hệ thống.
@@ -452,34 +480,6 @@ async def send_telegram_message(token: str, chat_id: str, text: str) -> None:
     await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
 
 
-async def run_scan_with_timeout(timeout_seconds: int = 120) -> None:
-    """
-    Chạy quét với timeout cứng để tránh tốn phút CI/GitHub Actions.
-    Nếu timeout, gửi cảnh báo Telegram rồi raise TimeoutError để caller xử lý thoát.
-    """
-    token = env_get("TELEGRAM_TOKEN", fallbacks=["TELEGRAM_BOT_TOKEN"])
-    chat_id = env_get("TELEGRAM_CHAT_ID", "")
-    try:
-        await asyncio.wait_for(scan_once_and_send(), timeout=timeout_seconds)
-    except asyncio.TimeoutError as e:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if token and chat_id:
-            try:
-                await send_telegram_message(
-                    token=token,
-                    chat_id=chat_id,
-                    text=(
-                        "Canh bao timeout\n"
-                        f"- Thoi gian: {now}\n"
-                        f"- Qua {timeout_seconds} giay van chua lay xong du lieu\n"
-                        "- Bot da tu dong dung phien quet de tranh lang phi tai nguyen."
-                    ),
-                )
-            except Exception:
-                pass
-        raise TimeoutError(f"Scan timeout after {timeout_seconds} seconds") from e
-
-
 async def scan_once_and_send() -> None:
     load_dotenv()
     init_vnstock_user()
@@ -495,27 +495,24 @@ async def scan_once_and_send() -> None:
     source = ",".join(source_candidates)
     # Chỉ lấy mức dữ liệu tối thiểu cần thiết cho MA20/MA50/MA200/RSI + vol20
     length = 220
-    exchanges = [x.strip().upper() for x in env_get("EXCHANGES", "HOSE,HNX").split(",") if x.strip()]
-
-    log("INFO", f"Bắt đầu quét | sources={source} | exchanges={exchanges} | length={length}")
+    log("INFO", f"Bắt đầu quét | sources={source} | universe=VN100 | length={length}")
 
     symbols: List[tuple[str, str]] = []
-    for ex in exchanges:
-        res = await run_blocking_with_timeout(
-            f"Lấy danh sách mã {ex}",
-            safe_get_symbols_with_fallback,
-            ex,
-            source_candidates,
-            timeout_seconds=request_timeout,
-        )
-        if res is None:
-            log("WARN", f"Bỏ qua sàn {ex} do timeout/lỗi khi lấy danh sách mã.")
-            continue
-        syms, _used_source = res
+    res_vn100 = await run_blocking_with_timeout(
+        "Lấy danh sách mã VN100",
+        safe_get_vn100_symbols_with_fallback,
+        source_candidates,
+        timeout_seconds=request_timeout,
+    )
+    if res_vn100 is None:
+        log("WARN", "Không lấy được danh sách VN100 do timeout/lỗi.")
+    else:
+        syms, used_src = res_vn100
+        log("INFO", f"VN100 lấy từ nguồn: {used_src or 'unknown'}")
         for s in syms:
             if s.isalpha() and 2 <= len(s) <= 5:
-                symbols.append((s, ex))
-    log("INFO", f"Tổng số mã sẽ quét: {len(symbols)}")
+                symbols.append((s, "VN100"))
+    log("INFO", f"Tổng số mã VN100 sẽ quét: {len(symbols)}")
 
     results: List[SignalResult] = []
     scanned = 0
@@ -543,7 +540,7 @@ async def scan_once_and_send() -> None:
                 timeout_seconds=request_timeout,
             )
             if not r0:
-                log("SKIP", f"{sym}: không thỏa điều kiện hoặc timeout/lỗi.")
+                log("SKIP", f"Bỏ qua mã {sym}")
                 continue
 
             # Rate-limit guard: sau mỗi lần gọi history() (nằm trong evaluate_symbol/load_history)
@@ -568,7 +565,7 @@ async def scan_once_and_send() -> None:
             log("HIT", f"{sym}: thỏa điều kiện mua.")
         except Exception:
             # Bỏ qua mã lỗi dữ liệu để không dừng toàn bộ vòng quét
-            log("ERROR", f"Lỗi không mong muốn khi quét {sym}, bỏ qua.")
+            log("ERROR", f"Bỏ qua mã {sym}")
             continue
 
         # Thở nhẹ thêm để giảm rủi ro rate-limit (ngoài sleep(2) theo từng API call)
@@ -709,7 +706,8 @@ async def main() -> None:
 
     token = env_get("TELEGRAM_TOKEN", fallbacks=["TELEGRAM_BOT_TOKEN"])
     if not token:
-        raise RuntimeError("Thiếu TELEGRAM_TOKEN trong biến môi trường")
+        log("ERROR", "Thiếu TELEGRAM_TOKEN trong biến môi trường")
+        return
 
     # Chế độ chạy 1 lần (phù hợp cho GitHub Actions/Task Scheduler)
     # Set SCAN_ONCE=1 để quét và gửi xong thì thoát.
@@ -728,8 +726,10 @@ async def main() -> None:
             tz = ZoneInfo("Asia/Ho_Chi_Minh")
 
             async def _job(_: ContextTypes.DEFAULT_TYPE) -> None:
-                timeout_seconds = int(env_get("SCAN_TIMEOUT_SECONDS", "120") or "120")
-                await run_scan_with_timeout(timeout_seconds=timeout_seconds)
+                try:
+                    await scan_once_and_send()
+                except Exception as e:
+                    log("ERROR", f"Lỗi job daily scan: {type(e).__name__}: {e}")
 
             application.job_queue.run_daily(
                 _job,
@@ -741,10 +741,12 @@ async def main() -> None:
     await application.initialize()
     await application.start()
     try:
-        timeout_seconds = int(env_get("SCAN_TIMEOUT_SECONDS", "120") or "120")
         if scan_once_flag:
             # Dành cho GitHub Actions: quét xong là thoát
-            await run_scan_with_timeout(timeout_seconds=timeout_seconds)
+            try:
+                await scan_once_and_send()
+            except Exception as e:
+                log("ERROR", f"Lỗi scan_once: {type(e).__name__}: {e}")
             return
 
         # Chạy bot Telegram (polling) để nhận lệnh /test
@@ -762,10 +764,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-        log("EXIT", "Bot đã hoàn tất và thoát an toàn.")
-        sys.exit(0)
-    except Exception as e:
-        log("FATAL", f"Bot thoát do lỗi: {type(e).__name__}: {e}")
-        sys.exit(1)
+    asyncio.run(main())
+    log("EXIT", "Bot đã hoàn tất và thoát an toàn.")
