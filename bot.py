@@ -137,6 +137,8 @@ class SignalResult:
     ma20_distance_pct: float
     vol: float
     vol_avg20: float
+    rvol: float
+    rvol_label: str
     warning: str
     reason: str
 
@@ -377,7 +379,17 @@ def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int 
     if not cond_vol_above_avg20:
         return EvalOutcome(symbol=symbol, exchange=exchange, info_line=info_line, skip_reason=f"không thỏa volume (Vol {vol_now:.0f} <= AvgVol20 {vol_avg20:.0f})", signal=None)
 
-    reason = f"Tich luy tot tren MA20 (cach {ma20_distance_pct:.2f}%) | src={used_source}"
+    rvol = vol_now / vol_avg20 if vol_avg20 > 0 else np.nan
+    if rvol > 2.0:
+        rvol_label = "🔥 DÒNG TIỀN ĐỘT BIẾN"
+    elif rvol >= 1.5:
+        rvol_label = "⭐ TIỀN VÀO MẠNH"
+    elif rvol < 1.0:
+        rvol_label = "⚠️ TIỀN YẾU"
+    else:
+        rvol_label = "Bình thường"
+
+    reason = f"Tich luy tot tren MA20 (cach {ma20_distance_pct:.2f}%) | RVOL={rvol:.2f} ({rvol_label})"
     sig = SignalResult(
             symbol=symbol,
             exchange=exchange,
@@ -390,6 +402,8 @@ def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int 
             ma20_distance_pct=ma20_distance_pct,
             vol=vol_now,
             vol_avg20=vol_avg20,
+            rvol=rvol,
+            rvol_label=rvol_label,
             warning="",
             reason=reason,
         )
@@ -402,14 +416,19 @@ def format_message(results: List[SignalResult], scanned: int, source: str) -> st
     if not results:
         return header + "\nKết thúc quét: Không có điểm mua an toàn hôm nay."
 
+    # Sắp xếp theo RVOL giảm dần
+    results_sorted = sorted(results, key=lambda x: x.rvol if np.isfinite(x.rvol) else -1, reverse=True)
+
     lines: List[str] = [header]
-    for r in results:
+    for r in results_sorted:
         lines.append(
-            f"🚀 PHÁT HIỆN VÙNG MUA: {r.symbol} đang tích lũy tốt trên MA20 (cách {r.ma20_distance_pct:.2f}%). "
-            f"Giá: {r.close:.2f}."
+            f"🚀 PHÁT HIỆN VÙNG MUA: *{r.symbol}* đang tích lũy tốt trên MA20 (cách {r.ma20_distance_pct:.2f}%).\n"
+            f"💰 Giá: {r.close:.2f} ({r.pct_change:+.2f}%)\n"
+            f"📊 Sức mạnh dòng tiền: {r.rvol:.2f} lần trung bình ({r.rvol_label})"
         )
         if r.warning:
-            lines.append(r.warning)
+            lines.append(f"⚠️ {r.warning}")
+        lines.append("") # Khoảng trống giữa các mã
     return "\n".join(lines)
 
 
@@ -498,6 +517,8 @@ async def scan_once_and_send() -> None:
                     ma200=r0.ma200,
                     vol=r0.vol,
                     vol_avg20=r0.vol_avg20,
+                    rvol=r0.rvol,
+                    rvol_label=r0.rvol_label,
                     warning="Thị trường chung đang xấu, hãy thận trọng" if market_bad else "",
                     reason=r0.reason,
                 )
