@@ -18,17 +18,32 @@ def _import_vnstock():
     Đoạn import này cố gắng tương thích cả hai.
     """
     try:
-        from vnstock import Listing, Quote  # type: ignore
+        from vnstock import Quote  # type: ignore
 
-        return Listing, Quote
+        return Quote
     except Exception:
         # Một số bản vẫn dùng module vnstock sau khi cài vnstock3, nên fallback này là “best effort”
-        from vnstock import Listing, Quote  # type: ignore
+        from vnstock import Quote  # type: ignore
 
-        return Listing, Quote
+        return Quote
 
 
-Listing, Quote = _import_vnstock()
+Quote = _import_vnstock()
+
+# Danh sách VN100 cố định (100 mã) dùng làm input quét.
+# Lưu ý: thành phần VN100 có thể thay đổi theo kỳ review của HOSE.
+VN100_TICKERS: List[str] = [
+    "ACB", "BCM", "BID", "BVH", "CTG", "FPT", "GAS", "GVR", "HDB", "HPG",
+    "MBB", "MSN", "MWG", "PLX", "POW", "SAB", "SHB", "SSB", "SSI", "STB",
+    "TCB", "TPB", "VCB", "VHM", "VIB", "VIC", "VJC", "VNM", "VPB", "VRE",
+    "ANV", "ASM", "BAF", "BFC", "BMP", "BSI", "C4G", "CII", "CMG", "CSM",
+    "D2D", "DCM", "DGC", "DHA", "DHC", "DIG", "DPM", "DPR", "DRC", "DXG",
+    "EIB", "EVF", "FRT", "FTS", "GEE", "GEX", "GEG", "GMD", "HAG", "HAH",
+    "HCM", "HHS", "HNG", "IDI", "IJC", "KBC", "KDC", "KDH", "LCG", "LPB",
+    "MSB", "NKG", "NLG", "NT2", "OCB", "ORS", "PAN", "PDR", "PHR", "PNJ",
+    "PTB", "PVD", "PVT", "QNS", "REE", "SCR", "SCS", "SIP", "SZC", "TCH",
+    "TLG", "VCG", "VCI", "VDS", "VGC", "VHC", "VIX", "VPI", "VSH", "KSB",
+]
 
 
 def env_get(name: str, default: str = "", *, fallbacks: Optional[List[str]] = None) -> str:
@@ -179,96 +194,6 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return df[["time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
 
 
-def safe_get_symbols(exchange: str, source: str = "VCI") -> List[str]:
-    """
-    Lấy danh sách mã theo sàn (HOSE/HNX).
-    Tuỳ phiên bản vnstock, Listing có thể có .hose()/.hnx() hoặc trả về DataFrame có cột sàn.
-    """
-    ex = exchange.strip().upper()
-    listing = Listing(source=source)
-
-    # 1) Ưu tiên API trực tiếp nếu có
-    direct_map = {
-        "HOSE": ("hose", "hose_symbols", "symbols_hose"),
-        "HNX": ("hnx", "hnx_symbols", "symbols_hnx"),
-    }
-    for attr in direct_map.get(ex, ()):
-        if hasattr(listing, attr):
-            try:
-                syms = getattr(listing, attr)()
-                if isinstance(syms, (list, tuple, pd.Series)):
-                    return [str(s).strip().upper() for s in syms if str(s).strip()]
-                if isinstance(syms, pd.DataFrame) and "symbol" in syms.columns:
-                    return [str(s).strip().upper() for s in syms["symbol"].tolist()]
-            except Exception:
-                pass
-
-    # 2) Fallback: lấy toàn bộ rồi lọc theo cột exchange
-    try:
-        all_syms = listing.all_symbols()
-        if isinstance(all_syms, (list, tuple, pd.Series)):
-            # Không có metadata về sàn → không thể lọc chắc chắn. Trả về danh sách như là “all”.
-            return [str(s).strip().upper() for s in all_syms if str(s).strip()]
-
-        if isinstance(all_syms, pd.DataFrame):
-            cols = {c.lower(): c for c in all_syms.columns}
-            sym_col = cols.get("symbol") or cols.get("ticker") or cols.get("code")
-            exch_col = cols.get("exchange") or cols.get("floor") or cols.get("market")
-
-            if sym_col and exch_col:
-                ex_df = all_syms[all_syms[exch_col].astype(str).str.upper().str.contains(ex)]
-                return [str(s).strip().upper() for s in ex_df[sym_col].tolist() if str(s).strip()]
-
-            if sym_col:
-                return [str(s).strip().upper() for s in all_syms[sym_col].tolist() if str(s).strip()]
-    except Exception:
-        pass
-
-    return []
-
-
-def safe_get_symbols_with_fallback(exchange: str, sources: List[str]) -> tuple[List[str], str]:
-    last_used = sources[0] if sources else "VCI"
-    for src in sources:
-        last_used = src
-        try:
-            symbols = safe_get_symbols(exchange=exchange, source=src)
-            if symbols:
-                return symbols, src
-        except Exception:
-            continue
-    return [], last_used
-
-
-def safe_get_vn100_symbols(source: str) -> List[str]:
-    listing = Listing(source=source)
-    for attr in ("vn100", "vn100_symbols", "symbols_vn100"):
-        if hasattr(listing, attr):
-            try:
-                data = getattr(listing, attr)()
-                if isinstance(data, (list, tuple, pd.Series)):
-                    return [str(s).strip().upper() for s in data if str(s).strip()]
-                if isinstance(data, pd.DataFrame):
-                    cols = {c.lower(): c for c in data.columns}
-                    sym_col = cols.get("symbol") or cols.get("ticker") or cols.get("code")
-                    if sym_col:
-                        return [str(s).strip().upper() for s in data[sym_col].tolist() if str(s).strip()]
-            except Exception:
-                pass
-    return []
-
-
-def safe_get_vn100_symbols_with_fallback(sources: List[str]) -> tuple[List[str], Optional[str]]:
-    for src in sources:
-        try:
-            symbols = safe_get_vn100_symbols(src)
-            if symbols:
-                return symbols, src
-        except Exception:
-            continue
-    return [], None
-
-
 def load_history(symbol: str, source: str, length: int) -> pd.DataFrame:
     """
     Lấy OHLCV theo ngày cho 1 mã. Dùng length (số phiên lùi lại) để tránh phụ thuộc ngày hệ thống.
@@ -392,7 +317,7 @@ def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int 
 
     # Bộ lọc thanh khoản cơ bản
     vol_avg20 = float(last["vol_avg20_prev"]) if pd.notna(last["vol_avg20_prev"]) else np.nan
-    if not np.isfinite(vol_avg20) or vol_avg20 <= 300_000:
+    if not np.isfinite(vol_avg20) or vol_avg20 <= 200_000:
         return None
 
     close = float(last["close"])
@@ -495,23 +420,15 @@ async def scan_once_and_send() -> None:
     source = ",".join(source_candidates)
     # Chỉ lấy mức dữ liệu tối thiểu cần thiết cho MA20/MA50/MA200/RSI + vol20
     length = 220
-    log("INFO", f"Bắt đầu quét | sources={source} | universe=VN100 | length={length}")
+    log("INFO", f"Bắt đầu quét | sources={source} | universe=VN100 cố định | length={length}")
+    log("INFO", "Đang bắt đầu quét danh sách VN100 cố định (100 mã)")
 
     symbols: List[tuple[str, str]] = []
-    res_vn100 = await run_blocking_with_timeout(
-        "Lấy danh sách mã VN100",
-        safe_get_vn100_symbols_with_fallback,
-        source_candidates,
-        timeout_seconds=request_timeout,
-    )
-    if res_vn100 is None:
-        log("WARN", "Không lấy được danh sách VN100 do timeout/lỗi.")
-    else:
-        syms, used_src = res_vn100
-        log("INFO", f"VN100 lấy từ nguồn: {used_src or 'unknown'}")
-        for s in syms:
-            if s.isalpha() and 2 <= len(s) <= 5:
-                symbols.append((s, "VN100"))
+    for s in VN100_TICKERS:
+        s2 = s.strip().upper()
+        if s2.isalpha() and 2 <= len(s2) <= 5:
+            symbols.append((s2, "VN100"))
+
     log("INFO", f"Tổng số mã VN100 sẽ quét: {len(symbols)}")
 
     results: List[SignalResult] = []
