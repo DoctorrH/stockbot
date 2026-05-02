@@ -446,6 +446,13 @@ async def main() -> None:
     if not token:
         raise RuntimeError("Thiếu TELEGRAM_BOT_TOKEN trong file .env")
 
+    # Chế độ chạy 1 lần (phù hợp cho GitHub Actions/Task Scheduler)
+    # Set SCAN_ONCE=1 để quét và gửi xong thì thoát.
+    scan_once_flag = os.getenv("SCAN_ONCE", "").strip().lower() in {"1", "true", "yes", "y"}
+    if scan_once_flag:
+        await scan_once_and_send()
+        return
+
     # Chạy bot Telegram (polling) để nhận lệnh /test
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("test", cmd_test))
