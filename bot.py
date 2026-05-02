@@ -134,10 +134,20 @@ class SignalResult:
     ma20: float
     ma50: float
     ma200: float
+    ma20_distance_pct: float
     vol: float
     vol_avg20: float
     warning: str
     reason: str
+
+
+@dataclass(frozen=True)
+class EvalOutcome:
+    symbol: str
+    exchange: str
+    info_line: str
+    skip_reason: str
+    signal: Optional[SignalResult]
 
 
 def sma(series: pd.Series, window: int) -> pd.Series:
@@ -303,12 +313,12 @@ def is_market_bad(sources: List[str], length: int = 10, threshold_pct: float = -
     return False
 
 
-def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int = 260) -> Optional[SignalResult]:
+def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int = 260) -> EvalOutcome:
     df, used_source = load_history_with_fallback(symbol=symbol, sources=sources, length=length)
     if not used_source:
-        return None
+        return EvalOutcome(symbol=symbol, exchange=exchange, info_line="", skip_reason="không lấy được dữ liệu lịch sử từ mọi nguồn", signal=None)
     if df.empty or len(df) < 220:
-        return None
+        return EvalOutcome(symbol=symbol, exchange=exchange, info_line="", skip_reason="không đủ dữ liệu để tính MA200", signal=None)
 
     df = calc_indicators(df)
 
@@ -318,7 +328,13 @@ def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int 
     # Bộ lọc thanh khoản cơ bản
     vol_avg20 = float(last["vol_avg20_prev"]) if pd.notna(last["vol_avg20_prev"]) else np.nan
     if not np.isfinite(vol_avg20) or vol_avg20 <= 200_000:
-        return None
+        return EvalOutcome(
+            symbol=symbol,
+            exchange=exchange,
+            info_line="",
+            skip_reason=f"không thỏa thanh khoản AvgVol20 ({vol_avg20:.0f}) <= 200000",
+            signal=None,
+        )
 
     close = float(last["close"])
     prev_close = float(prev["close"])
@@ -329,40 +345,40 @@ def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int 
     rsi_now = float(last["rsi14"]) if pd.notna(last["rsi14"]) else np.nan
     vol_now = float(last["volume"])
 
+    info_line = (
+        f"{symbol}: Giá={close:.2f}, MA20={ma20_now:.2f}, MA50={ma50_now:.2f}, "
+        f"MA200={ma200_now:.2f}, RSI={rsi_now:.2f}, %Tăng={pct_change:.2f}, "
+        f"Vol={vol_now:.0f}, AvgVol20={vol_avg20:.0f}, src={used_source}"
+    )
+
     if not (np.isfinite(ma20_now) and np.isfinite(ma50_now) and np.isfinite(ma200_now) and np.isfinite(rsi_now)):
-        return None
+        return EvalOutcome(symbol=symbol, exchange=exchange, info_line=info_line, skip_reason="chỉ báo không hợp lệ (NaN)", signal=None)
 
     # Điều kiện chiến lược + an toàn tối đa
     prev_ma20 = float(prev["ma20"]) if pd.notna(prev["ma20"]) else np.nan
     if not np.isfinite(prev_ma20):
         return None
 
-    # Trend: giá > MA50 và MA50 > MA200
+    # Trend: giá > MA50 (theo yêu cầu mới)
     cond_close_above_ma50 = close > ma50_now
-    cond_ma50_above_ma200 = ma50_now > ma200_now
-    # Cross-up MA20 hôm nay
-    cond_cross_up_ma20 = (prev_close <= prev_ma20) and (close > ma20_now)
-    # Không mua đuổi: không cao quá 5% so với MA20
-    cond_not_chase = close <= 1.05 * ma20_now
-    # Tín hiệu sức mạnh nến + volume
-    cond_price_jump = pct_change > 2.0
-    cond_vol_surge = vol_now > 1.5 * vol_avg20
-    # RSI vừa mạnh lên
-    cond_rsi_range = 50 <= rsi_now <= 60
+    # Vùng tích lũy trên MA20: close > MA20 và cách MA20 không quá 3%
+    ma20_distance_pct = ((close / ma20_now) - 1) * 100 if ma20_now else np.nan
+    cond_close_above_ma20 = close > ma20_now
+    cond_near_ma20 = np.isfinite(ma20_distance_pct) and ma20_distance_pct <= 3.0
+    # Khối lượng xác nhận có dòng tiền
+    cond_vol_above_avg20 = vol_now > vol_avg20
 
-    if all(
-        [
-            cond_close_above_ma50,
-            cond_ma50_above_ma200,
-            cond_cross_up_ma20,
-            cond_not_chase,
-            cond_price_jump,
-            cond_vol_surge,
-            cond_rsi_range,
-        ]
-    ):
-        reason = f"Gia vuot MA20, RSI dep, xu huong MA50/MA200 on dinh (src={used_source})"
-        return SignalResult(
+    if not cond_close_above_ma50:
+        return EvalOutcome(symbol=symbol, exchange=exchange, info_line=info_line, skip_reason=f"không thỏa MA50 (Giá {close:.2f} <= MA50 {ma50_now:.2f})", signal=None)
+    if not cond_close_above_ma20:
+        return EvalOutcome(symbol=symbol, exchange=exchange, info_line=info_line, skip_reason=f"không thỏa MA20 (Giá {close:.2f} <= MA20 {ma20_now:.2f})", signal=None)
+    if not cond_near_ma20:
+        return EvalOutcome(symbol=symbol, exchange=exchange, info_line=info_line, skip_reason=f"không thỏa vùng tích lũy (Giá cách MA20 {ma20_distance_pct:.2f}% > 3.00%)", signal=None)
+    if not cond_vol_above_avg20:
+        return EvalOutcome(symbol=symbol, exchange=exchange, info_line=info_line, skip_reason=f"không thỏa volume (Vol {vol_now:.0f} <= AvgVol20 {vol_avg20:.0f})", signal=None)
+
+    reason = f"Tich luy tot tren MA20 (cach {ma20_distance_pct:.2f}%) | src={used_source}"
+    sig = SignalResult(
             symbol=symbol,
             exchange=exchange,
             close=close,
@@ -371,13 +387,13 @@ def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int 
             ma20=ma20_now,
             ma50=ma50_now,
             ma200=ma200_now,
+            ma20_distance_pct=ma20_distance_pct,
             vol=vol_now,
             vol_avg20=vol_avg20,
             warning="",
             reason=reason,
         )
-
-    return None
+    return EvalOutcome(symbol=symbol, exchange=exchange, info_line=info_line, skip_reason="", signal=sig)
 
 
 def format_message(results: List[SignalResult], scanned: int, source: str) -> str:
@@ -389,8 +405,8 @@ def format_message(results: List[SignalResult], scanned: int, source: str) -> st
     lines: List[str] = [header]
     for r in results:
         lines.append(
-            f"🚀 PHÁT HIỆN ĐIỂM MUA: {r.symbol} - Giá: {r.close:.2f}. "
-            f"Lý do: Giá vượt MA20, RSI đẹp, xu hướng trung hạn (MA50) ổn định."
+            f"🚀 PHÁT HIỆN VÙNG MUA: {r.symbol} đang tích lũy tốt trên MA20 (cách {r.ma20_distance_pct:.2f}%). "
+            f"Giá: {r.close:.2f}."
         )
         if r.warning:
             lines.append(r.warning)
@@ -447,7 +463,7 @@ async def scan_once_and_send() -> None:
         scanned += 1
         log("SCAN", f"Đang quét mã {sym} ({ex})... [{scanned}/{len(symbols)}]")
         try:
-            r0 = await run_blocking_with_timeout(
+            outcome = await run_blocking_with_timeout(
                 f"Phân tích {sym}",
                 evaluate_symbol,
                 sym,
@@ -456,9 +472,16 @@ async def scan_once_and_send() -> None:
                 length,
                 timeout_seconds=request_timeout,
             )
-            if not r0:
-                log("SKIP", f"Bỏ qua mã {sym}")
+            if not outcome:
+                log("SKIP", f"Bỏ qua mã {sym} (timeout khi phân tích)")
                 continue
+            if outcome.info_line:
+                log("INFO", outcome.info_line)
+            if not outcome.signal:
+                reason = outcome.skip_reason or "không thỏa điều kiện"
+                log("SKIP", f"{sym} {reason}")
+                continue
+            r0 = outcome.signal
 
             # Rate-limit guard: sau mỗi lần gọi history() (nằm trong evaluate_symbol/load_history)
             await asyncio.sleep(2)
