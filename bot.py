@@ -486,11 +486,11 @@ async def scan_once_and_send() -> None:
             continue
 
         # Nghỉ 1 giây sau mỗi mã để giảm nhịp truy cập quá nhanh
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
 
         # Thở nhẹ thêm để giảm rủi ro rate-limit (ngoài sleep(2) theo từng API call)
         if scanned % 10 == 0:
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1.2)
 
     log("INFO", f"Quét xong. Số mã đạt điều kiện: {len(results)}")
     results = sorted(results, key=lambda x: (x.exchange, x.symbol))
