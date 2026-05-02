@@ -50,6 +50,26 @@ def init_vnstock_user() -> None:
     api_key = env_get("VNSTOCK_API_KEY", "")
     if not api_key:
         return
+
+
+def get_source_candidates() -> List[str]:
+    """
+    Danh sách nguồn dữ liệu theo thứ tự ưu tiên.
+    Mặc định ưu tiên VCI để tránh lỗi RetryError thường gặp ở KBS.
+    """
+    raw = env_get("VNSTOCK_SOURCES", "").strip()
+    if raw:
+        arr = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    else:
+        primary = env_get("VNSTOCK_SOURCE", "VCI").strip().upper() or "VCI"
+        fallback_default = ["VCI", "TCBS", "SSI", "KBS"]
+        arr = [primary] + [s for s in fallback_default if s != primary]
+
+    out: List[str] = []
+    for s in arr:
+        if s not in out:
+            out.append(s)
+    return out
     try:
         from vnstock import register_user  # type: ignore
 
@@ -128,7 +148,7 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return df[["time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
 
 
-def safe_get_symbols(exchange: str, source: str = "KBS") -> List[str]:
+def safe_get_symbols(exchange: str, source: str = "VCI") -> List[str]:
     """
     Lấy danh sách mã theo sàn (HOSE/HNX).
     Tuỳ phiên bản vnstock, Listing có thể có .hose()/.hnx() hoặc trả về DataFrame có cột sàn.
@@ -176,6 +196,19 @@ def safe_get_symbols(exchange: str, source: str = "KBS") -> List[str]:
     return []
 
 
+def safe_get_symbols_with_fallback(exchange: str, sources: List[str]) -> tuple[List[str], str]:
+    last_used = sources[0] if sources else "VCI"
+    for src in sources:
+        last_used = src
+        try:
+            symbols = safe_get_symbols(exchange=exchange, source=src)
+            if symbols:
+                return symbols, src
+        except Exception:
+            continue
+    return [], last_used
+
+
 def load_history(symbol: str, source: str, length: int) -> pd.DataFrame:
     """
     Lấy OHLCV theo ngày cho 1 mã. Dùng length (số phiên lùi lại) để tránh phụ thuộc ngày hệ thống.
@@ -186,6 +219,17 @@ def load_history(symbol: str, source: str, length: int) -> pd.DataFrame:
     except Exception:
         df = q.history(length=str(length), interval="d")
     return normalize_ohlcv(df)
+
+
+def load_history_with_fallback(symbol: str, sources: List[str], length: int) -> tuple[pd.DataFrame, Optional[str]]:
+    for src in sources:
+        try:
+            df = load_history(symbol=symbol, source=src, length=length)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df, src
+        except Exception:
+            continue
+    return pd.DataFrame(), None
 
 
 def load_intraday(symbol: str, source: str, date_yyyy_mm_dd: str) -> pd.DataFrame:
@@ -206,6 +250,17 @@ def load_intraday(symbol: str, source: str, date_yyyy_mm_dd: str) -> pd.DataFram
     if last_err:
         raise last_err
     return pd.DataFrame()
+
+
+def load_intraday_with_fallback(symbol: str, sources: List[str], date_yyyy_mm_dd: str) -> tuple[pd.DataFrame, Optional[str]]:
+    for src in sources:
+        try:
+            df = load_intraday(symbol=symbol, source=src, date_yyyy_mm_dd=date_yyyy_mm_dd)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df, src
+        except Exception:
+            continue
+    return pd.DataFrame(), None
 
 
 def intraday_volume_upto(df_intraday: pd.DataFrame, cutoff_hhmm: str) -> Optional[float]:
@@ -234,8 +289,10 @@ def intraday_volume_upto(df_intraday: pd.DataFrame, cutoff_hhmm: str) -> Optiona
     return float(df[vol_col].sum())
 
 
-def evaluate_symbol(symbol: str, exchange: str, source: str, length: int = 130) -> Optional[SignalResult]:
-    df = load_history(symbol=symbol, source=source, length=length)
+def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int = 130) -> Optional[SignalResult]:
+    df, used_source = load_history_with_fallback(symbol=symbol, sources=sources, length=length)
+    if not used_source:
+        return None
     if df.empty or len(df) < 60:
         return None
 
@@ -277,7 +334,7 @@ def evaluate_symbol(symbol: str, exchange: str, source: str, length: int = 130) 
     # Xác nhận volume intraday sẽ check ở scan_once_and_send (cần cutoff)
 
     if all([cond_close_above_ma50, cond_cross_up_ma20, cond_rsi_range]):
-        reason = "Close>MA50, cross-up MA20, RSI(14) 45-60"
+        reason = f"Close>MA50, cross-up MA20, RSI(14) 45-60 | src={used_source}"
         return SignalResult(
             symbol=symbol,
             exchange=exchange,
@@ -325,6 +382,34 @@ async def send_telegram_message(token: str, chat_id: str, text: str) -> None:
     await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
 
 
+async def run_scan_with_timeout(timeout_seconds: int = 120) -> None:
+    """
+    Chạy quét với timeout cứng để tránh tốn phút CI/GitHub Actions.
+    Nếu timeout, gửi cảnh báo Telegram rồi raise TimeoutError để caller xử lý thoát.
+    """
+    token = env_get("TELEGRAM_TOKEN", fallbacks=["TELEGRAM_BOT_TOKEN"])
+    chat_id = env_get("TELEGRAM_CHAT_ID", "")
+    try:
+        await asyncio.wait_for(scan_once_and_send(), timeout=timeout_seconds)
+    except asyncio.TimeoutError as e:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if token and chat_id:
+            try:
+                await send_telegram_message(
+                    token=token,
+                    chat_id=chat_id,
+                    text=(
+                        "Canh bao timeout\n"
+                        f"- Thoi gian: {now}\n"
+                        f"- Qua {timeout_seconds} giay van chua lay xong du lieu\n"
+                        "- Bot da tu dong dung phien quet de tranh lang phi tai nguyen."
+                    ),
+                )
+            except Exception:
+                pass
+        raise TimeoutError(f"Scan timeout after {timeout_seconds} seconds") from e
+
+
 async def scan_once_and_send() -> None:
     load_dotenv()
     init_vnstock_user()
@@ -335,7 +420,8 @@ async def scan_once_and_send() -> None:
     if not token or not chat_id:
         raise RuntimeError("Thiếu TELEGRAM_TOKEN hoặc TELEGRAM_CHAT_ID trong biến môi trường")
 
-    source = env_get("VNSTOCK_SOURCE", "KBS") or "KBS"
+    source_candidates = get_source_candidates()
+    source = ",".join(source_candidates)
     length = int(env_get("HISTORY_LENGTH", "130") or "130")
     exchanges = [x.strip().upper() for x in env_get("EXCHANGES", "HOSE,HNX").split(",") if x.strip()]
     cutoff_hhmm = env_get("VOLUME_CUTOFF_HHMM", "14:25") or "14:25"
@@ -344,7 +430,8 @@ async def scan_once_and_send() -> None:
 
     symbols: List[tuple[str, str]] = []
     for ex in exchanges:
-        for s in safe_get_symbols(exchange=ex, source=source):
+        syms, _used_source = safe_get_symbols_with_fallback(exchange=ex, sources=source_candidates)
+        for s in syms:
             if s.isalpha() and 2 <= len(s) <= 5:
                 symbols.append((s, ex))
 
@@ -354,14 +441,18 @@ async def scan_once_and_send() -> None:
     for sym, ex in symbols:
         scanned += 1
         try:
-            r0 = evaluate_symbol(symbol=sym, exchange=ex, source=source, length=length)
+            r0 = evaluate_symbol(symbol=sym, exchange=ex, sources=source_candidates, length=length)
             if not r0:
                 continue
 
             # Rate-limit guard: sau mỗi lần gọi history() (nằm trong evaluate_symbol/load_history)
             await asyncio.sleep(2)
 
-            intraday_df = load_intraday(symbol=sym, source=source, date_yyyy_mm_dd=today)
+            intraday_df, intraday_source = load_intraday_with_fallback(
+                symbol=sym, sources=source_candidates, date_yyyy_mm_dd=today
+            )
+            if not intraday_source:
+                continue
             intraday_vol = intraday_volume_upto(intraday_df, cutoff_hhmm=cutoff_hhmm)
             if intraday_vol is None:
                 continue
@@ -384,7 +475,11 @@ async def scan_once_and_send() -> None:
                     vol=r0.vol,
                     vol_avg20=r0.vol_avg20,
                     intraday_vol=float(intraday_vol),
-                    reason=r0.reason + f" + Vol@{cutoff_hhmm} ≥ {int(volume_ratio_min * 100)}% Avg20",
+                    reason=(
+                        r0.reason
+                        + f" + Vol@{cutoff_hhmm} ≥ {int(volume_ratio_min * 100)}% Avg20"
+                        + f" | intra={intraday_source}"
+                    ),
                 )
             )
         except Exception:
@@ -420,32 +515,36 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     load_dotenv()
     init_vnstock_user()
 
-    source = env_get("VNSTOCK_SOURCE", "KBS") or "KBS"
+    source_candidates = get_source_candidates()
     cutoff_hhmm = datetime.now().strftime("%H:%M")
     today = datetime.now().strftime("%Y-%m-%d")
 
     symbols = ["FPT", "SSI", "HPG"]
-    parts = [f"Test OK ({today} {cutoff_hhmm}) | Source: {source}"]
+    parts = [f"Test OK ({today} {cutoff_hhmm}) | Sources: {', '.join(source_candidates)}"]
 
     for sym in symbols:
         try:
             # Ưu tiên intraday (giá “hiện tại”)
-            df_i = load_intraday(symbol=sym, source=source, date_yyyy_mm_dd=today)
+            df_i, used_intraday = load_intraday_with_fallback(
+                symbol=sym, sources=source_candidates, date_yyyy_mm_dd=today
+            )
             px = latest_price_from_intraday(df_i)
             # Rate-limit guard
             await asyncio.sleep(2)
 
             # Fallback: lấy close gần nhất nếu intraday không có
             if px is None:
-                df_h = load_history(symbol=sym, source=source, length=5)
+                df_h, used_history = load_history_with_fallback(symbol=sym, sources=source_candidates, length=5)
                 if not df_h.empty:
                     px = float(df_h["close"].iloc[-1])
+                    used_intraday = used_history
                 await asyncio.sleep(2)
 
             if px is None:
                 parts.append(f"- {sym}: (không lấy được giá)")
             else:
-                parts.append(f"- {sym}: {px:.2f}")
+                src_label = used_intraday or "unknown"
+                parts.append(f"- {sym}: {px:.2f} (src={src_label})")
         except Exception as e:
             parts.append(f"- {sym}: lỗi {type(e).__name__}")
 
@@ -475,7 +574,8 @@ async def main() -> None:
             tz = ZoneInfo("Asia/Ho_Chi_Minh")
 
             async def _job(_: ContextTypes.DEFAULT_TYPE) -> None:
-                await scan_once_and_send()
+                timeout_seconds = int(env_get("SCAN_TIMEOUT_SECONDS", "120") or "120")
+                await run_scan_with_timeout(timeout_seconds=timeout_seconds)
 
             application.job_queue.run_daily(
                 _job,
@@ -487,9 +587,10 @@ async def main() -> None:
     await application.initialize()
     await application.start()
     try:
+        timeout_seconds = int(env_get("SCAN_TIMEOUT_SECONDS", "120") or "120")
         if scan_once_flag:
             # Dành cho GitHub Actions: quét xong là thoát
-            await scan_once_and_send()
+            await run_scan_with_timeout(timeout_seconds=timeout_seconds)
             return
 
         # Chạy bot Telegram (polling) để nhận lệnh /test
