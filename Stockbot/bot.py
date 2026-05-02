@@ -31,11 +31,23 @@ def _import_vnstock():
 Listing, Quote = _import_vnstock()
 
 
+def env_get(name: str, default: str = "", *, fallbacks: Optional[List[str]] = None) -> str:
+    """
+    Lấy biến môi trường (headless-friendly). Có hỗ trợ fallback tên cũ để tương thích.
+    """
+    if name in os.environ and os.environ[name].strip():
+        return os.environ[name].strip()
+    for fb in fallbacks or []:
+        if fb in os.environ and os.environ[fb].strip():
+            return os.environ[fb].strip()
+    return default
+
+
 def init_vnstock_user() -> None:
     """
     Nếu có API key, đăng ký user để tăng hạn mức request/phút.
     """
-    api_key = os.getenv("VNSTOCK_API_KEY", "").strip()
+    api_key = env_get("VNSTOCK_API_KEY", "")
     if not api_key:
         return
     try:
@@ -317,16 +329,17 @@ async def scan_once_and_send() -> None:
     load_dotenv()
     init_vnstock_user()
 
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    # Ưu tiên TELEGRAM_TOKEN theo yêu cầu; fallback TELEGRAM_BOT_TOKEN để tương thích.
+    token = env_get("TELEGRAM_TOKEN", fallbacks=["TELEGRAM_BOT_TOKEN"])
+    chat_id = env_get("TELEGRAM_CHAT_ID", "")
     if not token or not chat_id:
-        raise RuntimeError("Thiếu TELEGRAM_BOT_TOKEN hoặc TELEGRAM_CHAT_ID trong file .env")
+        raise RuntimeError("Thiếu TELEGRAM_TOKEN hoặc TELEGRAM_CHAT_ID trong biến môi trường")
 
-    source = os.getenv("VNSTOCK_SOURCE", "KBS").strip() or "KBS"
-    length = int(os.getenv("HISTORY_LENGTH", "130").strip() or "130")
-    exchanges = [x.strip().upper() for x in os.getenv("EXCHANGES", "HOSE,HNX").split(",") if x.strip()]
-    cutoff_hhmm = os.getenv("VOLUME_CUTOFF_HHMM", "14:25").strip() or "14:25"
-    volume_ratio_min = float(os.getenv("VOLUME_RATIO_MIN", "0.80").strip() or "0.80")
+    source = env_get("VNSTOCK_SOURCE", "KBS") or "KBS"
+    length = int(env_get("HISTORY_LENGTH", "130") or "130")
+    exchanges = [x.strip().upper() for x in env_get("EXCHANGES", "HOSE,HNX").split(",") if x.strip()]
+    cutoff_hhmm = env_get("VOLUME_CUTOFF_HHMM", "14:25") or "14:25"
+    volume_ratio_min = float(env_get("VOLUME_RATIO_MIN", "0.80") or "0.80")
     today = datetime.now().strftime("%Y-%m-%d")
 
     symbols: List[tuple[str, str]] = []
@@ -407,7 +420,7 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     load_dotenv()
     init_vnstock_user()
 
-    source = os.getenv("VNSTOCK_SOURCE", "KBS").strip() or "KBS"
+    source = env_get("VNSTOCK_SOURCE", "KBS") or "KBS"
     cutoff_hhmm = datetime.now().strftime("%H:%M")
     today = datetime.now().strftime("%Y-%m-%d")
 
@@ -442,13 +455,13 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def main() -> None:
     load_dotenv()
 
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    token = env_get("TELEGRAM_TOKEN", fallbacks=["TELEGRAM_BOT_TOKEN"])
     if not token:
-        raise RuntimeError("Thiếu TELEGRAM_BOT_TOKEN trong file .env")
+        raise RuntimeError("Thiếu TELEGRAM_TOKEN trong biến môi trường")
 
     # Chế độ chạy 1 lần (phù hợp cho GitHub Actions/Task Scheduler)
     # Set SCAN_ONCE=1 để quét và gửi xong thì thoát.
-    scan_once_flag = os.getenv("SCAN_ONCE", "").strip().lower() in {"1", "true", "yes", "y"}
+    scan_once_flag = env_get("SCAN_ONCE", "").lower() in {"1", "true", "yes", "y"}
     if scan_once_flag:
         await scan_once_and_send()
         return
@@ -459,7 +472,7 @@ async def main() -> None:
 
     # Tuỳ chọn: nếu bạn vẫn muốn script tự “push” kết quả quét theo lịch nội bộ
     # (không cần Task Scheduler), bật DAILY_SCAN_HHMM. Ví dụ: DAILY_SCAN_HHMM=14:25
-    daily_hhmm = os.getenv("DAILY_SCAN_HHMM", "").strip()
+    daily_hhmm = env_get("DAILY_SCAN_HHMM", "")
     if daily_hhmm:
         try:
             hh, mm = [int(x) for x in daily_hhmm.split(":")]
