@@ -1,9 +1,10 @@
 import asyncio
 import os
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
+from datetime import datetime
+from typing import List, Optional
 from zoneinfo import ZoneInfo
+from typing import Tuple
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
@@ -620,9 +621,14 @@ def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int 
                 priority_label = "💤 TÍCH LŨY KIỆT VOL (THEO DÕI)"
                 priority_level = 2
         
-        # Nhóm RS trung bình tích lũy nền dài (Mới)
+        # Nhóm RS trung bình tích lũy nền dài
         elif 1.2 <= rs_score < 1.25 and is_weekly_ok and w_weeks >= 4 and rvol < 0.8:
             priority_label = "💎 GOM HÀNG NỀN DÀI"
+            priority_level = 2
+            
+        # Nhóm RS hạng 2 có dòng tiền đột biến (Mới)
+        elif 1.15 <= rs_score < 1.25 and is_weekly_ok and rvol > 2.5:
+            priority_label = "🚀 DÒNG TIỀN ĐỘT BIẾN (HẠNG 2)"
             priority_level = 2
         
         # 4. CHẶN BẪY VOLUME (Climax) - Né bẫy D2D
