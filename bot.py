@@ -12,23 +12,23 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 
-def _import_vnstock():
+from vnstock.api.quote import Quote
+
+
+def get_history(symbol: str, source: str, length: int) -> pd.DataFrame:
     """
-    vnstock3 đã đổi tên gói trên PyPI thành 'vnstock' (nhưng nhiều nơi vẫn cài 'vnstock3').
-    Đoạn import này cố gắng tương thích cả hai.
+    Lấy dữ liệu lịch sử theo chuẩn Migration 2025.
     """
+    q = Quote(symbol=symbol, source=source)
+    now = datetime.now()
+    # Lấy dư 60% số ngày để bù cuối tuần/lễ
+    start_date = (now - timedelta(days=int(length) * 1.6)).strftime("%Y-%m-%d")
+    end_date = now.strftime("%Y-%m-%d")
     try:
-        from vnstock import Quote  # type: ignore
-
-        return Quote
+        df = q.history(start=start_date, end=end_date, interval="1D")
+        return normalize_ohlcv(df)
     except Exception:
-        # Một số bản vẫn dùng module vnstock sau khi cài vnstock3, nên fallback này là “best effort”
-        from vnstock import Quote  # type: ignore
-
-        return Quote
-
-
-Quote = _import_vnstock()
+        return pd.DataFrame()
 
 # Danh sách VN100 cố định (100 mã) dùng làm input quét.
 # Lưu ý: thành phần VN100 có thể thay đổi theo kỳ review của HOSE.
@@ -139,6 +139,13 @@ class SignalResult:
     vol_avg20: float
     rvol: float
     rvol_label: str
+    filter_label: str
+    special_label: str
+    priority_level: int
+    rs_score: float  # Chỉ số RS
+    is_weekly_ok: bool  # Trạng thái MA20 tuần
+    w_weeks: int  # Số tuần liên tiếp trên MA20 tuần
+    spread: float  # Biên độ nến
     warning: str
     reason: str
 
@@ -170,6 +177,33 @@ def rsi(close: pd.Series, window: int = 14) -> pd.Series:
     rs = avg_gain / avg_loss.replace(0, np.nan)
     out = 100 - (100 / (1 + rs))
     return out
+
+
+def analyze_candle_shape(o: float, h: float, l: float, c: float, po: float, pc: float) -> Optional[str]:
+    """
+    Phân tích hình dạng nến dựa trên các quy tắc kỹ thuật.
+    """
+    total_length = h - l
+    if total_length == 0:
+        return None
+    
+    body = abs(c - o)
+    low_shadow = min(o, c) - l
+    
+    # Pin Bar (Hammer): (low_shadow > 0.6 * total_length) AND (body nằm ở 1/3 phía trên)
+    if (low_shadow > 0.6 * total_length) and (min(o, c) >= l + (2/3) * total_length):
+        return "Pin Bar"
+    
+    # Doji: (body < 0.1 * total_length)
+    if body < 0.1 * total_length:
+        return "Doji"
+        
+    # Engulfing: (body > prev_body) AND (close > open) AND (prev_close < prev_open)
+    prev_body = abs(pc - po)
+    if (body > prev_body) and (c > o) and (pc < po):
+        return "Engulfing"
+        
+    return None
 
 
 def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
@@ -207,15 +241,7 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_history(symbol: str, source: str, length: int) -> pd.DataFrame:
-    """
-    Lấy OHLCV theo ngày cho 1 mã. Dùng length (số phiên lùi lại) để tránh phụ thuộc ngày hệ thống.
-    """
-    q = Quote(symbol=symbol, source=source)
-    try:
-        df = q.history(length=str(length), interval="1D")
-    except Exception:
-        df = q.history(length=str(length), interval="d")
-    return normalize_ohlcv(df)
+    return get_history(symbol, source, length)
 
 
 def load_history_with_fallback(symbol: str, sources: List[str], length: int) -> tuple[pd.DataFrame, Optional[str]]:
@@ -236,27 +262,74 @@ def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["ma200"] = sma(out["close"], 200)
     out["rsi14"] = rsi(out["close"], 14)
     out["vol_avg20_prev"] = out["volume"].shift(1).rolling(window=20, min_periods=20).mean()
+    out["perf"] = out["close"].pct_change() * 100
     return out
 
 
 def load_intraday(symbol: str, source: str, date_yyyy_mm_dd: str) -> pd.DataFrame:
     """
-    Lấy dữ liệu khớp lệnh trong ngày (intraday). Tham số có thể khác nhau theo nguồn,
-    nên thử vài cách phổ biến để tương thích.
+    Lấy dữ liệu khớp lệnh trong ngày bằng chuẩn Migration 2025.
     """
     q = Quote(symbol=symbol, source=source)
-    last_err: Optional[Exception] = None
-    for kwargs in ({"date": date_yyyy_mm_dd}, {"trading_date": date_yyyy_mm_dd}):
-        try:
-            df = q.intraday(**kwargs)
-            if isinstance(df, pd.DataFrame):
-                return df.copy()
-        except Exception as e:
-            last_err = e
-            continue
-    if last_err:
-        raise last_err
+    try:
+        df = q.intraday(date=date_yyyy_mm_dd)
+        if isinstance(df, pd.DataFrame):
+            return df.copy()
+    except Exception as e:
+        log("ERROR", f"Lỗi load_intraday {symbol}: {e}")
     return pd.DataFrame()
+
+
+def calculate_rs_score(stock_df: pd.DataFrame, index_df: pd.DataFrame) -> float:
+    """
+    Tính RS = (Price_now / Price_50) / (Index_now / Index_50)
+    """
+    if len(stock_df) < 50 or len(index_df) < 50:
+        return 0.0
+    
+    stock_now = stock_df["close"].iloc[-1]
+    stock_50 = stock_df["close"].iloc[-50]
+    index_now = index_df["close"].iloc[-1]
+    index_50 = index_df["close"].iloc[-50]
+    
+    if stock_50 == 0 or index_50 == 0:
+        return 0.0
+        
+    return (stock_now / stock_50) / (index_now / index_50)
+
+
+def check_weekly_status(df: pd.DataFrame) -> Tuple[bool, int]:
+    """
+    Kiểm tra xem giá hiện tại có nằm trên đường MA20 tuần không và đếm số tuần liên tiếp.
+    Trả về: (is_above, consecutive_weeks)
+    """
+    if len(df) < 150: # Cần khoảng 30 tuần dữ liệu
+        return False, 0
+        
+    # Resample sang khung tuần
+    df_weekly = df.set_index("time").resample("W").agg({
+        "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
+    }).dropna()
+    
+    if len(df_weekly) < 20:
+        return False, 0
+        
+    df_weekly["ma20_w"] = df_weekly["close"].rolling(window=20).mean()
+    df_weekly = df_weekly.dropna(subset=["ma20_w"])
+    
+    if df_weekly.empty:
+        return False, 0
+        
+    is_above = df_weekly["close"].iloc[-1] > df_weekly["ma20_w"].iloc[-1]
+    
+    consecutive = 0
+    for i in range(len(df_weekly) - 1, -1, -1):
+        if df_weekly["close"].iloc[i] > df_weekly["ma20_w"].iloc[i]:
+            consecutive += 1
+        else:
+            break
+            
+    return is_above, consecutive
 
 
 def load_intraday_with_fallback(symbol: str, sources: List[str], date_yyyy_mm_dd: str) -> tuple[pd.DataFrame, Optional[str]]:
@@ -296,23 +369,74 @@ def intraday_volume_upto(df_intraday: pd.DataFrame, cutoff_hhmm: str) -> Optiona
     return float(df[vol_col].sum())
 
 
-def is_market_bad(sources: List[str], length: int = 10, threshold_pct: float = -1.0) -> bool:
+async def check_market_kill_switch(sources: List[str], tickers: List[str], request_timeout: int) -> tuple[bool, str]:
     """
-    VN-Index giảm mạnh (>1%) thì trả True để chèn cảnh báo thận trọng.
+    Kiểm tra các điều kiện an toàn của thị trường.
+    Trả về (is_killed, alert_message).
     """
+    # 1. Kiểm tra VN-Index
+    log("INFO", "Đang kiểm tra Market Kill Switch (VN-Index)...")
     for idx_symbol in ("VNINDEX", "VN-INDEX"):
-        df, _src = load_history_with_fallback(symbol=idx_symbol, sources=sources, length=length)
-        if df.empty or len(df) < 2:
-            continue
-        last = float(df["close"].iloc[-1])
-        prev = float(df["close"].iloc[-2])
-        if prev == 0:
-            continue
-        pct = ((last / prev) - 1) * 100
-        if pct <= threshold_pct:
-            return True
-        return False
-    return False
+        res_h = await run_blocking_with_timeout(
+            f"Lấy dữ liệu {idx_symbol}",
+            load_history_with_fallback,
+            idx_symbol,
+            sources,
+            50,
+            timeout_seconds=request_timeout,
+        )
+        if res_h:
+            df, _ = res_h
+            if len(df) >= 2:
+                df["rsi"] = rsi(df["close"], 14)
+                last = df.iloc[-1]
+                prev = df.iloc[-2]
+                
+                pct_change = ((last["close"] / prev["close"]) - 1) * 100
+                rsi_now = last["rsi"]
+                rsi_prev = prev["rsi"]
+                rsi_drop = rsi_prev - rsi_now
+                
+                if pct_change < -2.0 or rsi_drop > 5.0:
+                    msg = f"🚨 THỊ TRƯỜNG RỦI RO CAO\nVN-Index giảm {pct_change:.2f}% | RSI giảm {rsi_drop:.2f} điểm"
+                    return True, msg
+            break
+
+    # 2. Kiểm tra Độ rộng thị trường (Mã giảm sàn)
+    log("INFO", "Đang kiểm tra Độ rộng thị trường (VN100)...")
+    floor_count = 0
+    scanned_count = 0
+    threshold = len(tickers) * 0.05
+    
+    for sym in tickers:
+        scanned_count += 1
+        res = await run_blocking_with_timeout(
+            f"Breadth check {sym}",
+            load_history_with_fallback,
+            sym,
+            sources,
+            2,
+            timeout_seconds=request_timeout,
+        )
+        if res:
+            df_b, _ = res
+            if len(df_b) >= 2:
+                c = df_b["close"].iloc[-1]
+                p = df_b["close"].iloc[-2]
+                pct = (c / p - 1) * 100
+                if pct <= -6.9:
+                    floor_count += 1
+        
+        if floor_count > threshold:
+            msg = f"💀 CẢNH BÁO SẬP DIỆN RỘNG\nSố mã giảm sàn: {floor_count} (>5% danh sách quét)"
+            return True, msg
+            
+        # Nghỉ ngắn hơn vì đây là bước check tiền thị trường
+        await asyncio.sleep(1.0)
+        if scanned_count % 20 == 0:
+            log("INFO", f"Đã check breadth {scanned_count}/{len(tickers)} mã...")
+
+    return False, ""
 
 
 def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int = 260) -> EvalOutcome:
@@ -357,29 +481,56 @@ def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int 
         return EvalOutcome(symbol=symbol, exchange=exchange, info_line=info_line, skip_reason="chỉ báo không hợp lệ (NaN)", signal=None)
 
     # Điều kiện chiến lược + an toàn tối đa
-    prev_ma20 = float(prev["ma20"]) if pd.notna(prev["ma20"]) else np.nan
-    if not np.isfinite(prev_ma20):
-        return None
+    def get_row_data(idx):
+        if idx < 0 or idx >= len(df):
+            return None
+        r = df.iloc[idx]
+        c = float(r["close"])
+        v = float(r["volume"])
+        m20 = float(r["ma20"]) if pd.notna(r["ma20"]) else np.nan
+        m50 = float(r["ma50"]) if pd.notna(r["ma50"]) else np.nan
+        m200 = float(r["ma200"]) if pd.notna(r["ma200"]) else np.nan
+        rsi_val = float(r["rsi14"]) if pd.notna(r["rsi14"]) else np.nan
+        va20 = float(r["vol_avg20_prev"]) if pd.notna(r["vol_avg20_prev"]) else np.nan
+        p = float(r["perf"]) if pd.notna(r["perf"]) else 0.0
+        rv = v / va20 if va20 > 0 else np.nan
+        return {
+            "close": c, "volume": v, "ma20": m20, "ma50": m50, "ma200": m200,
+            "rsi": rsi_val, "vol_avg20": va20, "perf": p, "rvol": rv
+        }
 
-    # Trend: giá > MA50 (theo yêu cầu mới)
-    cond_close_above_ma50 = close > ma50_now
-    # Vùng tích lũy trên MA20: close > MA20 và cách MA20 không quá 3%
-    ma20_distance_pct = ((close / ma20_now) - 1) * 100 if ma20_now else np.nan
-    cond_close_above_ma20 = close > ma20_now
-    cond_near_ma20 = np.isfinite(ma20_distance_pct) and ma20_distance_pct <= 3.0
-    # Khối lượng xác nhận có dòng tiền
-    cond_vol_above_avg20 = vol_now > vol_avg20
+    curr = get_row_data(-1)
+    prev1 = get_row_data(-2)
+    prev2 = get_row_data(-3)
 
-    if not cond_close_above_ma50:
-        return EvalOutcome(symbol=symbol, exchange=exchange, info_line=info_line, skip_reason=f"không thỏa MA50 (Giá {close:.2f} <= MA50 {ma50_now:.2f})", signal=None)
-    if not cond_close_above_ma20:
-        return EvalOutcome(symbol=symbol, exchange=exchange, info_line=info_line, skip_reason=f"không thỏa MA20 (Giá {close:.2f} <= MA20 {ma20_now:.2f})", signal=None)
-    if not cond_near_ma20:
-        return EvalOutcome(symbol=symbol, exchange=exchange, info_line=info_line, skip_reason=f"không thỏa vùng tích lũy (Giá cách MA20 {ma20_distance_pct:.2f}% > 3.00%)", signal=None)
-    if not cond_vol_above_avg20:
-        return EvalOutcome(symbol=symbol, exchange=exchange, info_line=info_line, skip_reason=f"không thỏa volume (Vol {vol_now:.0f} <= AvgVol20 {vol_avg20:.0f})", signal=None)
+    if curr is None or not np.isfinite(curr["ma20"]):
+        return EvalOutcome(symbol=symbol, exchange=exchange, info_line=info_line, skip_reason="chỉ báo không hợp lệ (NaN)", signal=None)
 
-    rvol = vol_now / vol_avg20 if vol_avg20 > 0 else np.nan
+    # Step 1 Check (Watchlist)
+    def is_step1(data):
+        if data is None: return False
+        # RVOL 0.5 - 1.0 AND Price near MA20 (+-2%) AND Avg Volume > 200k
+        cond_rvol = 0.5 <= data["rvol"] < 1.0
+        cond_ma20 = abs(data["close"] / data["ma20"] - 1) <= 0.02
+        cond_vol = data["vol_avg20"] > 200000
+        return cond_rvol and cond_ma20 and cond_vol
+
+    is_watchlist = is_step1(curr)
+    is_breakout = False
+    if curr["perf"] > 2.0 and prev1 and prev2:
+        cond_prev1_sideways = abs(prev1["perf"]) <= 0.5
+        cond_prev2_sideways = abs(prev2["perf"]) <= 0.5
+        if cond_prev1_sideways and cond_prev2_sideways and is_step1(prev1) and is_step1(prev2):
+            is_breakout = True
+
+    if is_breakout:
+        filter_label = "🚀 BREAKOUT SIGNAL"
+    elif is_watchlist:
+        filter_label = "👀 Watchlist (Step 1)"
+    else:
+        return EvalOutcome(symbol=symbol, exchange=exchange, info_line=info_line, skip_reason="không thỏa bộ lọc 2 lớp (Watchlist/Breakout)", signal=None)
+
+    rvol = curr["rvol"]
     if rvol > 2.0:
         rvol_label = "🔥 DÒNG TIỀN ĐỘT BIẾN"
     elif rvol >= 1.5:
@@ -389,21 +540,146 @@ def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int 
     else:
         rvol_label = "Bình thường"
 
-    reason = f"Tich luy tot tren MA20 (cach {ma20_distance_pct:.2f}%) | RVOL={rvol:.2f} ({rvol_label})"
+    # Phân tích hình dạng nến
+    o, h, l, c = float(last["open"]), float(last["high"]), float(last["low"]), float(last["close"])
+    po, pc = float(prev["open"]), float(prev["close"])
+    candle_shape = analyze_candle_shape(o, h, l, c, po, pc)
+    
+    # Tính toán đặc điểm nến cho logic mới
+    body = abs(c - o)
+    candle_range = h - l
+    upper_shadow = h - max(o, c)
+    
+    ma20_distance_pct = (curr["close"] / curr["ma20"] - 1) * 100
+    
+    # Phân tích hình dạng nến
+    o, h, l, c = float(last["open"]), float(last["high"]), float(last["low"]), float(last["close"])
+    po, pc = float(prev["open"]), float(prev["close"])
+    candle_shape = analyze_candle_shape(o, h, l, c, po, pc)
+    
+    # Lọc Đa khung thời gian: MA20 tuần
+    is_weekly_ok, w_weeks = check_weekly_status(df)
+    
+    # Candle Spread: (High - Low) / Close_yesterday * 100
+    candle_spread = (h - l) / pc * 100 if pc > 0 else 0
+    
+    # Xác định Mức độ ưu tiên và Nhãn mới theo chuẩn 9.5 nâng cao
+    priority_level = 4
+    priority_label = ""
+    
+    perf_today = curr["perf"]
+    rvol = curr["rvol"]
+    m20 = curr["ma20"]
+    rs_score = kwargs.get("rs_score", 0.0)
+
+    if is_weekly_ok:
+        # 1. BỘ LỌC CỨNG: RS THẤP (Loại bỏ hàng yếu)
+        if rs_score < 1.15:
+            if perf_today > 3.0:
+                priority_label = "⚠️ NỔ GIẢ (RS THẤP)"
+                priority_level = 3
+            else:
+                priority_label = "💤 CHỜ DÒNG TIỀN (KIÊN NHẪN)"
+                priority_level = 4
+        
+        # 2. NHÓM SIÊU CỔ & RS MẠNH (Nhận diện Rũ bỏ sớm - Cập nhật 3 cấp độ)
+        elif rs_score > 1.3 and perf_today < 0:
+            # Quy tắc loại bỏ: Giảm sâu kèm vol lớn không phải rũ bỏ
+            if perf_today < -2.5 and rvol > 0.8:
+                priority_label = "👀 THEO DÕI THÊM"
+                priority_level = 4
+            # Cấp độ 1: Rũ bỏ chuẩn (Cực kỳ an toàn)
+            elif rvol < 0.8:
+                priority_label = "💎 RŨ BỎ CHUẨN (MUA GOM)"
+                priority_level = 1
+            # Cấp độ 2: Rũ bỏ linh hoạt (Bắt siêu cổ)
+            elif -2.0 < perf_today < 0 and 0.8 <= rvol < 1.1:
+                priority_label = "🔥 RŨ BỎ LINH HOẠT (THEO DÕI MUA)"
+                priority_level = 1
+            else:
+                priority_label = "👀 THEO DÕI THÊM"
+                priority_level = 4
+
+        # 3. NHÓM SIÊU CỔ (RS > 1.5) - Ưu tiên tuyệt đối khi giá giữ vững
+        elif rs_score > 1.5:
+            if perf_today >= -2.0:
+                priority_label = "🔥 SIÊU CỔ ĐANG CHẠY"
+                priority_level = 1
+        
+        # 4. NHÓM RS MẠNH (1.25 - 1.5) - Các trạng thái khác
+        elif 1.25 <= rs_score <= 1.5:
+            # Điểm nổ chuẩn
+            if perf_today > 2.0 and rvol > 1.5:
+                priority_label = "🚀 XÁC NHẬN ĐIỂM NỔ TIN CẬY"
+                priority_level = 1
+            # Bứt phá cạn cung
+            elif perf_today > 2.0 and rvol < 1.0:
+                priority_label = "🚀 CẠN CUNG BỨT PHÁ"
+                priority_level = 1 if rs_score >= 1.35 else 3
+            # Tích lũy kiệt Vol
+            elif abs(perf_today) < 1.0 and rvol < 0.8:
+                priority_label = "💤 TÍCH LŨY KIỆT VOL (THEO DÕI)"
+                priority_level = 2
+        
+        # Nhóm RS trung bình tích lũy nền dài (Mới)
+        elif 1.2 <= rs_score < 1.25 and is_weekly_ok and w_weeks >= 4 and rvol < 0.8:
+            priority_label = "💎 GOM HÀNG NỀN DÀI"
+            priority_level = 2
+        
+        # 4. CHẶN BẪY VOLUME (Climax) - Né bẫy D2D
+        if rvol > 5.0:
+            priority_label = "⚠️ CAO TRÀO MUA (RỦI RO)"
+            priority_level = 3
+            
+        # 5. BỘ LỌC BIẾN ĐỘ LỎNG (Volatility Filter) - Né bẫy CII
+        elif candle_spread > 8.0 and rvol > 1.8:
+            priority_label = "⚠️ BIẾN ĐỘNG LỎNG (HƯNG PHẤN QUÁ ĐÀ)"
+            priority_level = 3
+
+        # 6. CẢNH BÁO THIẾU VOL (Hàng điều tiết)
+        elif perf_today > 2.0 and rvol < 0.7 and rs_score < 1.3:
+            priority_label = "⚠️ BẬT TĂNG THIẾU VOL (HÀNG ĐIỀU TIẾT)"
+            priority_level = 3
+
+    # Cảnh báo quá điểm mua
+    # Ngưỡng Quá mua cực đại cho Siêu cổ (RS > 2.0)
+    if rs_score > 2.0 and ma20_distance_pct > 20.0:
+        priority_label = "⚠️ QUÁ MUA (KHÔNG ĐU ĐUỔI)"
+        priority_level = 3
+    # Cảnh báo quá điểm mua thông thường
+    elif abs(ma20_distance_pct) > 15.0 and rs_score <= 1.5:
+        priority_label = "⚠️ QUÁ ĐIỂM MUA"
+        priority_level = 3
+
+    if not priority_label:
+        priority_label = "👀 THEO DÕI THÊM"
+        priority_level = 4
+
+    special_label = priority_label if priority_label else (candle_shape or "")
+    
+    reason = f"P{priority_level} | RS={kwargs.get('rs_score', 0):.2f} | W_MA20={is_weekly_ok} | RVOL={rvol:.2f}"
+    
     sig = SignalResult(
             symbol=symbol,
             exchange=exchange,
-            close=close,
-            pct_change=pct_change,
-            rsi14=rsi_now,
-            ma20=ma20_now,
-            ma50=ma50_now,
-            ma200=ma200_now,
+            close=curr["close"],
+            pct_change=curr["perf"],
+            rsi14=curr["rsi"],
+            ma20=curr["ma20"],
+            ma50=curr["ma50"],
+            ma200=curr["ma200"],
             ma20_distance_pct=ma20_distance_pct,
-            vol=vol_now,
-            vol_avg20=vol_avg20,
+            vol=curr["volume"],
+            vol_avg20=curr["vol_avg20"],
             rvol=rvol,
             rvol_label=rvol_label,
+            filter_label=filter_label,
+            special_label=special_label,
+            priority_level=priority_level,
+            rs_score=kwargs.get("rs_score", 0.0),
+            is_weekly_ok=is_weekly_ok,
+            w_weeks=w_weeks,
+            spread=candle_spread,
             warning="",
             reason=reason,
         )
@@ -416,16 +692,22 @@ def format_message(results: List[SignalResult], scanned: int, source: str) -> st
     if not results:
         return header + "\nKết thúc quét: Không có điểm mua an toàn hôm nay."
 
-    # Sắp xếp theo RVOL giảm dần
-    results_sorted = sorted(results, key=lambda x: x.rvol if np.isfinite(x.rvol) else -1, reverse=True)
+    # Sắp xếp theo priority_level (tăng dần) rồi đến rs_score (giảm dần)
+    results_sorted = sorted(results, key=lambda x: (x.priority_level, -x.rs_score))
 
     lines: List[str] = [header]
     for r in results_sorted:
-        lines.append(
-            f"🚀 PHÁT HIỆN VÙNG MUA: *{r.symbol}* đang tích lũy tốt trên MA20 (cách {r.ma20_distance_pct:.2f}%).\n"
-            f"💰 Giá: {r.close:.2f} ({r.pct_change:+.2f}%)\n"
-            f"📊 Sức mạnh dòng tiền: {r.rvol:.2f} lần trung bình ({r.rvol_label})"
+        emoji = "🚀" if "XÁC NHẬN" in r.special_label else ("💎" if "SIÊU CỔ" in r.special_label else "👀")
+        msg = (
+            f"{emoji} <b>{r.symbol}</b> | {r.special_label or r.filter_label}\n"
+            f"───────────────────\n"
+            f"💰 Giá: <b>{r.close:,.2f}</b> ({r.pct_change:+.2f}%)\n"
+            f"📊 RS: <b>{r.rs_score:.2f}</b> | RVOL: <b>{r.rvol:.2f}</b>\n"
+            f"📏 Spread: <b>{r.spread:.2f}%</b> | MA20: <b>{r.ma20:.2f}</b>\n"
+            f"📍 Cách MA20: <b>{r.ma20_distance_pct:+.2f}%</b> | Tuần: {'✅' if r.is_weekly_ok else '❌'} ({r.w_weeks}w)\n"
+            f"───────────────────\n"
         )
+        lines.append(msg)
         if r.warning:
             lines.append(f"⚠️ {r.warning}")
         lines.append("") # Khoảng trống giữa các mã
@@ -453,10 +735,8 @@ async def scan_once_and_send() -> None:
     request_timeout = get_request_timeout_seconds()
     source_candidates = get_source_candidates()
     source = ",".join(source_candidates)
-    # Chỉ lấy mức dữ liệu tối thiểu cần thiết cho MA20/MA50/MA200/RSI + vol20
-    length = 220
     log("INFO", f"Bắt đầu quét | sources={source} | universe=VN100 cố định | length={length}")
-    log("INFO", "Đang bắt đầu quét danh sách VN100 cố định (100 mã)")
+    log("INFO", "Đang khởi động bộ lọc 9.5 điểm (Vui lòng đợi khoảng 2 phút do giới hạn API)...")
 
     symbols: List[tuple[str, str]] = []
     for s in VN100_TICKERS:
@@ -466,21 +746,47 @@ async def scan_once_and_send() -> None:
 
     log("INFO", f"Tổng số mã VN100 sẽ quét: {len(symbols)}")
 
+    # Bước 1: Tiền xử lý - Tính RS Ranking
+    log("INFO", "Bắt đầu bước Tiền xử lý (Pre-processing): Tính RS Ranking...")
+    index_df, _ = load_history_with_fallback("VNINDEX", source_candidates, 60)
+    
+    rs_results = []
+    for sym, _ in symbols:
+        df_rs, _ = load_history_with_fallback(sym, source_candidates, 60)
+        score = calculate_rs_score(df_rs, index_df)
+        rs_results.append((sym, score))
+        await asyncio.sleep(0.5)
+        
+    # Lấy top 20%
+    rs_results.sort(key=lambda x: x[1], reverse=True)
+    top_rs_count = int(len(symbols) * 0.2)
+    top_rs_tickers = {x[0] for x in rs_results[:top_rs_count]}
+    rs_map = {x[0]: x[1] for x in rs_results}
+    
+    log("INFO", f"Đã xác định {len(top_rs_tickers)} mã mạnh nhất thị trường (Top 20% RS).")
+
     results: List[SignalResult] = []
     scanned = 0
-    market_bad_res = await run_blocking_with_timeout(
-        "Đánh giá thị trường chung VN-Index",
-        is_market_bad,
+    count_signals = 0
+    kill_switch_res = await check_market_kill_switch(
         source_candidates,
-        10,
-        -1.0,
-        timeout_seconds=request_timeout,
+        VN100_TICKERS,
+        request_timeout,
     )
-    market_bad = bool(market_bad_res) if market_bad_res is not None else False
+    is_killed, kill_msg = kill_switch_res
+    if is_killed:
+        log("KILL", f"Kích hoạt Kill Switch: {kill_msg}")
+        header = f"VN Trend+Momentum Scanner - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        full_msg = f"{header}\n{kill_msg}\n\n⚠️ TÍN HIỆU DỪNG: Ngừng quét toàn bộ để đảm bảo an toàn vốn."
+        await send_telegram_message(token=token, chat_id=chat_id, text=full_msg)
+        return
 
     for sym, ex in symbols:
+        if sym not in top_rs_tickers:
+            continue
+            
         scanned += 1
-        log("SCAN", f"Đang quét mã {sym} ({ex})... [{scanned}/{len(symbols)}]")
+        log("SCAN", f"Đang quét mã mạnh {sym} ({ex})... [{scanned}/{len(top_rs_tickers)}]")
         try:
             outcome = await run_blocking_with_timeout(
                 f"Phân tích {sym}",
@@ -489,41 +795,26 @@ async def scan_once_and_send() -> None:
                 ex,
                 source_candidates,
                 length,
+                rs_score=rs_map.get(sym, 0.0), # Truyền RS score vào
                 timeout_seconds=request_timeout,
             )
             if not outcome:
-                log("SKIP", f"Bỏ qua mã {sym} (timeout khi phân tích)")
                 continue
+            
             if outcome.info_line:
                 log("INFO", outcome.info_line)
-            if not outcome.signal:
+
+            if outcome.signal:
+                results.append(outcome.signal)
+                count_signals += 1
+                log("HIT", f"{sym}: thỏa điều kiện mua.")
+            else:
                 reason = outcome.skip_reason or "không thỏa điều kiện"
                 log("SKIP", f"{sym} {reason}")
-                continue
-            r0 = outcome.signal
 
-            # Rate-limit guard: sau mỗi lần gọi history() (nằm trong evaluate_symbol/load_history)
+            # Rate-limit guard
             await asyncio.sleep(2)
 
-            results.append(
-                SignalResult(
-                    symbol=r0.symbol,
-                    exchange=r0.exchange,
-                    close=r0.close,
-                    pct_change=r0.pct_change,
-                    rsi14=r0.rsi14,
-                    ma20=r0.ma20,
-                    ma50=r0.ma50,
-                    ma200=r0.ma200,
-                    vol=r0.vol,
-                    vol_avg20=r0.vol_avg20,
-                    rvol=r0.rvol,
-                    rvol_label=r0.rvol_label,
-                    warning="Thị trường chung đang xấu, hãy thận trọng" if market_bad else "",
-                    reason=r0.reason,
-                )
-            )
-            log("HIT", f"{sym}: thỏa điều kiện mua.")
         except Exception:
             # Bỏ qua mã lỗi dữ liệu để không dừng toàn bộ vòng quét
             log("ERROR", f"Bỏ qua mã {sym}")
@@ -537,6 +828,12 @@ async def scan_once_and_send() -> None:
             await asyncio.sleep(1.2)
 
     log("INFO", f"Quét xong. Số mã đạt điều kiện: {len(results)}")
+    if not results:
+        msg = "--- 📭 KHÔNG CÓ MÃ NÀO ĐỦ ĐIỀU KIỆN (CHUẨN 9.5 ĐIỂM) TRONG PHIÊN HÔM NAY ---"
+        log("INFO", msg)
+        await send_telegram_message(token=token, chat_id=chat_id, text=msg)
+        return
+        
     results = sorted(results, key=lambda x: (x.exchange, x.symbol))
     msg = format_message(results=results, scanned=scanned, source=source)
     await send_telegram_message(token=token, chat_id=chat_id, text=msg)
