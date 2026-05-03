@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional
 from zoneinfo import ZoneInfo
-
+from typing import Tuple
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
