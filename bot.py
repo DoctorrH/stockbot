@@ -1,10 +1,9 @@
 import asyncio
 import os
 from dataclasses import dataclass
-from datetime import datetime
-from typing import List, Optional
+from datetime import datetime, timedelta
+from typing import List, Optional, Tuple
 from zoneinfo import ZoneInfo
-from typing import Tuple
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
@@ -735,6 +734,7 @@ async def scan_once_and_send() -> None:
     request_timeout = get_request_timeout_seconds()
     source_candidates = get_source_candidates()
     source = ",".join(source_candidates)
+    length = 220
     log("INFO", f"Bắt đầu quét | sources={source} | universe=VN100 cố định | length={length}")
     log("INFO", "Đang khởi động bộ lọc 9.5 điểm (Vui lòng đợi khoảng 2 phút do giới hạn API)...")
 
