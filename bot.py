@@ -439,7 +439,7 @@ async def check_market_kill_switch(sources: List[str], tickers: List[str], reque
     return False, ""
 
 
-def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int = 260) -> EvalOutcome:
+def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int = 260, **kwargs) -> EvalOutcome:
     df, used_source = load_history_with_fallback(symbol=symbol, sources=sources, length=length)
     if not used_source:
         return EvalOutcome(symbol=symbol, exchange=exchange, info_line="", skip_reason="không lấy được dữ liệu lịch sử từ mọi nguồn", signal=None)
@@ -821,9 +821,9 @@ async def scan_once_and_send() -> None:
             # Rate-limit guard
             await asyncio.sleep(2)
 
-        except Exception:
-            # Bỏ qua mã lỗi dữ liệu để không dừng toàn bộ vòng quét
-            log("ERROR", f"Bỏ qua mã {sym}")
+        except Exception as e:
+            # Bỏ qua mã lỗi dữ liệu và log chi tiết lỗi
+            log("ERROR", f"Lỗi khi quét mã {sym}: {type(e).__name__}: {e}")
             continue
 
         # Nghỉ 1 giây sau mỗi mã để giảm nhịp truy cập quá nhanh
