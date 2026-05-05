@@ -295,10 +295,19 @@ async def scan_once_and_send():
 
 async def send_telegram_message(token, chat_id, text):
     import requests
+    if not token or not chat_id:
+        log("ERROR", "Thiếu TELEGRAM_TOKEN hoặc TELEGRAM_CHAT_ID trong file .env")
+        return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    try: requests.post(url, json=payload, timeout=15)
-    except: pass
+    try:
+        response = requests.post(url, json=payload, timeout=15)
+        if response.status_code == 200:
+            log("INFO", f"Đã gửi tin nhắn đến Telegram (ChatID: {chat_id})")
+        else:
+            log("ERROR", f"Telegram API báo lỗi: {response.status_code} - {response.text}")
+    except Exception as e:
+        log("ERROR", f"Không thể kết nối đến Telegram: {e}")
 
 async def main():
     await scan_once_and_send()
