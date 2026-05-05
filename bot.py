@@ -5,7 +5,6 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
-from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -65,7 +64,7 @@ class EvalOutcome:
     skip_reason: str
     signal: Optional[SignalResult]
 
-# --- UTILS & DATA ---
+# --- UTILS & DATA (COPIED FROM BACKTEST) ---
 
 def log(level: str, message: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -110,17 +109,7 @@ def load_history_with_fallback(symbol: str, sources: List[str], length: int) -> 
         if not df.empty: return df, src
     return pd.DataFrame(), None
 
-def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out["ma20"] = sma(out["close"], 20)
-    out["ma50"] = sma(out["close"], 50)
-    out["ma200"] = sma(out["close"], 200)
-    out["rsi14"] = rsi(out["close"], 14)
-    out["vol_avg20_prev"] = out["volume"].shift(1).rolling(window=20, min_periods=20).mean()
-    out["perf"] = out["close"].pct_change() * 100
-    return out
-
-def check_weekly_status(df: pd.DataFrame) -> Tuple[bool, int]:
+def check_weekly_status(df: pd.DataFrame, target_date: Optional[datetime] = None) -> Tuple[bool, int]:
     if len(df) < 150: return False, 0
     df_weekly = df.set_index("time").resample("W").agg({
         "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
@@ -129,7 +118,8 @@ def check_weekly_status(df: pd.DataFrame) -> Tuple[bool, int]:
     df_weekly["ma20_w"] = df_weekly["close"].rolling(window=20).mean()
     df_weekly = df_weekly.dropna(subset=["ma20_w"])
     if df_weekly.empty: return False, 0
-    is_above = df_weekly["close"].iloc[-1] > df_weekly["ma20_w"].iloc[-1]
+    last_row = df_weekly.iloc[-1]
+    is_above = last_row["close"] > last_row["ma20_w"]
     consecutive = 0
     for i in range(len(df_weekly)-1, -1, -1):
         if df_weekly["close"].iloc[i] > df_weekly["ma20_w"].iloc[i]: consecutive += 1
@@ -143,88 +133,101 @@ def calculate_rs_score(stock_df: pd.DataFrame, index_df: pd.DataFrame) -> float:
     if s_50 == 0 or i_50 == 0: return 0.0
     return (s_now / s_50) / (i_now / i_50)
 
-# --- CORE EVALUATION V10 ---
+# --- MARKET PROTECTIONS ---
+
+async def check_market_kill_switch(sources: List[str], tickers: List[str]) -> Tuple[bool, str]:
+    log("INFO", "Kiểm tra Market Kill Switch...")
+    idx_df, _ = await asyncio.to_thread(load_history_with_fallback, "VNINDEX", sources, 50)
+    if not idx_df.empty and len(idx_df) >= 2:
+        idx_df["rsi"] = rsi(idx_df["close"], 14)
+        last, prev = idx_df.iloc[-1], idx_df.iloc[-2]
+        pct = (last["close"]/prev["close"] - 1)*100
+        rsi_drop = prev["rsi"] - last["rsi"]
+        if pct < -2.0 or rsi_drop > 5.0:
+            return True, f"🚨 VNINDEX giảm {pct:.2f}% | RSI rơi {rsi_drop:.2f}đ"
+    return False, ""
+
+# --- CORE EVALUATION (COPIED LOGIC FROM BACKTEST) ---
 
 def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int = 220, **kwargs) -> EvalOutcome:
     df, used_source = load_history_with_fallback(symbol, sources, length)
     if not used_source: return EvalOutcome(symbol, exchange, "", "không lấy được dữ liệu", None)
-    if len(df) < 200: return EvalOutcome(symbol, exchange, "", "thiếu dữ liệu", None)
     
-    df = calc_indicators(df)
+    df["ma20"] = sma(df["close"], 20)
+    df["ma50"] = sma(df["close"], 50)
+    df["ma200"] = sma(df["close"], 200)
+    df["rsi14"] = rsi(df["close"], 14)
+    df["vol_avg20"] = df["volume"].shift(1).rolling(window=20).mean()
+    df["perf"] = df["close"].pct_change() * 100
+    
+    if len(df) < 50 or not np.isfinite(df["ma20"].iloc[-1]):
+        return EvalOutcome(symbol, exchange, "", "thiếu dữ liệu kỹ thuật", None)
+        
     last, prev = df.iloc[-1], df.iloc[-2]
     
-    vol_avg20 = float(last["vol_avg20_prev"])
-    if vol_avg20 <= 200_000: return EvalOutcome(symbol, exchange, "", f"thanh khoản thấp", None)
-    
-    h, l, c = float(last["high"]), float(last["low"]), float(last["close"])
+    o, h, l, c = float(last["open"]), float(last["high"]), float(last["low"]), float(last["close"])
     pc = float(prev["close"])
-    perf_today = last["perf"]
+    perf_today = float(last["perf"])
+    vol_avg20 = float(last["vol_avg20"])
     rvol = float(last["volume"] / vol_avg20) if vol_avg20 > 0 else 0
     rs_score = kwargs.get("rs_score", 0.0)
     is_weekly_ok, w_weeks = check_weekly_status(df)
     candle_spread = (h - l) / pc * 100 if pc > 0 else 0
     ma20_distance_pct = (c / last["ma20"] - 1) * 100
     
-    info_line = f"{symbol}: RS={rs_score:.2f}, RVOL={rvol:.2f}, Perf={perf_today:.2f}%"
+    info_line = f"{symbol}: Giá={c:.2f}, RS={rs_score:.2f}, RVOL={rvol:.2f}"
 
-    priority_level = 4
-    priority_label = ""
+    label = ""
+    priority = 4
 
-    # PHÂN LOẠI CHI TIẾT THEO V10
     if is_weekly_ok:
+        # 1. RS THẤP
         if rs_score < 1.15:
-            if perf_today > 3.0: priority_label, priority_level = "⚠️ NỔ GIẢ (RS THẤP)", 3
-            else: priority_label, priority_level = "💤 CHỜ DÒNG TIỀN", 4
+            if perf_today > 3.0: label, priority = "⚠️ NỔ GIẢ (RS THẤP)", 3
+            else: label, priority = "💤 CHỜ DÒNG TIỀN", 4
         
-        # Nhóm Rũ bỏ
+        # 2. RŨ BỎ (SHAKEOUT)
         elif rs_score > 1.3 and perf_today < 0:
-            if perf_today < -2.5:
-                if rvol > 0.8: priority_label, priority_level = "👀 THEO DÕI THÊM", 4
-                else: priority_label, priority_level = "💎 RŨ BỎ CHUẨN (MUA GOM)", 1
-            elif rvol < 0.8: priority_label, priority_level = "💎 RŨ BỎ CHUẨN (MUA GOM)", 1
-            elif -2.0 < perf_today < 0 and 0.8 <= rvol < 1.1:
-                priority_label, priority_level = "🔥 RŨ BỎ LINH HOẠT", 1
-            else:
-                priority_label, priority_level = "💎 RŨ BỎ KỸ THUẬT", 2
-        
-        # Nhóm Điểm nổ
-        elif perf_today > 2.0 and rvol > 1.5:
-            if rs_score > 1.5: priority_label, priority_level = "🚀 SIÊU CỔ XÁC NHẬN NỔ", 1
-            else: priority_label, priority_level = "🚀 XÁC NHẬN ĐIỂM NỔ", 2
-        
-        # Nhóm Cạn cung / Kiệt Vol
-        elif abs(perf_today) < 1.0 and rvol < 0.8:
-            if rs_score >= 1.35: priority_label, priority_level = "🚀 CẠN CUNG BỨT PHÁ", 1
-            else: priority_label, priority_level = "💤 TÍCH LŨY KIỆT VOL", 2
-            
-        # Nền dài
-        elif 1.2 <= rs_score < 1.25 and w_weeks >= 4 and rvol < 0.8:
-            priority_label, priority_level = "💎 GOM HÀNG NỀN DÀI", 2
-            
-        # Dòng tiền đột biến
-        elif 1.15 <= rs_score < 1.25 and rvol > 2.5:
-            priority_label, priority_level = "🚀 DÒNG TIỀN ĐỘT BIẾN (HẠNG 2)", 2
+            if perf_today < -2.5 and rvol > 0.8: label, priority = "👀 THEO DÕI THÊM", 4
+            elif rvol < 0.8: label, priority = "💎 RŨ BỎ CHUẨN (MUA GOM)", 1
+            elif -2.0 < perf_today < 0 and 0.8 <= rvol < 1.1: label, priority = "🔥 RŨ BỎ LINH HOẠT", 1
+            else: label, priority = "💎 RŨ BỎ KỸ THUẬT", 2
 
-    # CHẶN BẪY RỦI RO
-    if rvol > 5.0: priority_label, priority_level = "⚠️ CAO TRÀO MUA (RỦI RO)", 3
-    elif candle_spread > 8.0 and rvol > 1.8: priority_label, priority_level = "⚠️ BIẾN ĐỘNG LỎNG (RỦI RO)", 3
-    elif rs_score > 2.0 and ma20_distance_pct > 20.0: priority_label, priority_level = "⚠️ QUÁ MUA (KHÔNG ĐU)", 3
-    elif abs(ma20_distance_pct) > 15.0 and rs_score <= 1.5: priority_label, priority_level = "⚠️ QUÁ ĐIỂM MUA", 3
+        # 3. SIÊU CỔ ĐANG CHẠY
+        elif rs_score > 1.5:
+            if perf_today >= -2.0: label, priority = "🔥 SIÊU CỔ ĐANG CHẠY", 1
+        
+        # 4. ĐIỂM NỔ & CẠN CUNG
+        elif 1.25 <= rs_score <= 1.5:
+            if perf_today > 2.0 and rvol > 1.5: label, priority = "🚀 XÁC NHẬN ĐIỂM NỔ", 1
+            elif perf_today > 2.0 and rvol < 1.0: label, priority = "🚀 CẠN CUNG BỨT PHÁ", 1 if rs_score >= 1.35 else 3
+            elif abs(perf_today) < 1.0 and rvol < 0.8: label, priority = "💤 TÍCH LŨY KIỆT VOL", 2
+        
+        # 5. NỀN DÀI & DÒNG TIỀN ĐỘT BIẾN
+        elif 1.2 <= rs_score < 1.25 and w_weeks >= 4 and rvol < 0.8: label, priority = "💎 GOM HÀNG NỀN DÀI", 2
+        elif 1.15 <= rs_score < 1.25 and rvol > 2.5: label, priority = "🚀 DÒNG TIỀN ĐỘT BIẾN (HẠNG 2)", 2
 
-    if not priority_label:
-        priority_label, priority_level = "👀 THEO DÕI THÊM", 4
+        # CHẶN BẪY
+        if rvol > 5.0: label, priority = "⚠️ CAO TRÀO MUA (RỦI RO)", 3
+        elif candle_spread > 8.0 and rvol > 1.8: label, priority = "⚠️ BIẾN ĐỘNG LỎNG", 3
+        elif perf_today > 2.0 and rvol < 0.7 and rs_score < 1.3: label, priority = "⚠️ TĂNG THIẾU VOL", 3
+
+    # CẢNH BÁO QUÁ MUA
+    if rs_score > 2.0 and ma20_distance_pct > 20.0: label, priority = "⚠️ QUÁ MUA (KHÔNG ĐU)", 3
+    elif ma20_distance_pct > 15.0 and rs_score <= 1.5: label, priority = "⚠️ QUÁ ĐIỂM MUA", 3
+
+    if not label: label, priority = "👀 THEO DÕI THÊM", 4
     
     sig = SignalResult(
         symbol=symbol, exchange=exchange, close=c, pct_change=perf_today,
-        rsi14=last["rsi14"], ma20=last["ma20"], ma50=last["ma50"], ma200=last["ma200"],
+        rsi14=last["rsi14"], ma20=last["ma20"], ma50=last["ma50"], ma200=df["ma200"].iloc[-1],
         ma20_distance_pct=ma20_distance_pct, vol=last["volume"], vol_avg20=vol_avg20,
-        rvol=rvol, special_label=priority_label, priority_level=priority_level,
+        rvol=rvol, special_label=label, priority_level=priority,
         rs_score=rs_score, is_weekly_ok=is_weekly_ok, w_weeks=w_weeks, spread=candle_spread,
-        reason=f"P{priority_level}"
+        reason=f"P{priority}"
     )
     
-    # TRẢ VỀ KẾT QUẢ CHO TẤT CẢ P1, P2, P3 ĐỂ KHỚP VỚI BACKTEST
-    return EvalOutcome(symbol, exchange, info_line, "", sig if priority_level <= 3 else None)
+    return EvalOutcome(symbol, exchange, info_line, "", sig if priority <= 3 else None)
 
 # --- BOT INTERFACE ---
 
@@ -253,9 +256,16 @@ async def scan_once_and_send():
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     sources = ["KBS", "VCI", "TCBS", "SSI"]
     
-    log("INFO", "Bắt đầu quét V10 chuyên sâu (Sync with Backtest)...")
+    log("INFO", "Bắt đầu quét V10 (Logic 1:1 từ Backtest)...")
     
-    # RS Ranking (Dùng 220 phiên như Backtest)
+    # 1. Kill Switch
+    is_killed, kill_msg = await check_market_kill_switch(sources, VN100_TICKERS)
+    if is_killed:
+        log("KILL", kill_msg)
+        await send_telegram_message(token, chat_id, f"⚠️ <b>DỪNG QUÉT KHẨN CẤP</b>\n\n{kill_msg}")
+        return
+
+    # 2. RS Ranking (220 phiên)
     idx_df, _ = await asyncio.to_thread(load_history_with_fallback, "VNINDEX", sources, 220)
     rs_results = []
     for t in VN100_TICKERS:
@@ -281,7 +291,7 @@ async def scan_once_and_send():
         await send_telegram_message(token, chat_id, msg)
         log("INFO", f"Gửi {len(results)} tín hiệu thành công.")
     else:
-        log("INFO", "Không tìm thấy mã đạt tiêu chuẩn V10.")
+        log("INFO", "Không tìm thấy mã đạt tiêu chuẩn.")
 
 async def send_telegram_message(token, chat_id, text):
     import requests
@@ -291,7 +301,6 @@ async def send_telegram_message(token, chat_id, text):
     except: pass
 
 async def main():
-    load_dotenv()
     await scan_once_and_send()
 
 if __name__ == "__main__":
