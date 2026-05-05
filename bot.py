@@ -100,13 +100,13 @@ def log(level: str, message: str) -> None:
     print(f"[{ts}] [{level}] {message}")
 
 
-async def run_blocking_with_timeout(label: str, func, *args, timeout_seconds: int):
+async def run_blocking_with_timeout(label: str, func, *args, timeout_seconds: int, **kwargs):
     """
     Chạy hàm sync trong thread và timeout cứng để tránh treo CI.
     """
     log("START", f"{label} (timeout={timeout_seconds}s)")
     try:
-        result = await asyncio.wait_for(asyncio.to_thread(func, *args), timeout=timeout_seconds)
+        result = await asyncio.wait_for(asyncio.to_thread(func, *args, **kwargs), timeout=timeout_seconds)
         log("DONE", label)
         return result
     except asyncio.TimeoutError:
