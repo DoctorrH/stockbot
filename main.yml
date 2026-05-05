@@ -3,8 +3,8 @@ name: Stockbot scan (14:25 ICT)
 on:
   schedule:
     # GitHub Actions cron uses UTC.
-    # 14:25 (UTC+7, Vietnam) = 07:25 UTC.
-    - cron: "25 7 * * 1-5"
+    # 12:25 (UTC+7, Vietnam) = 05:25 UTC.
+    - cron: "25 5 * * 1-5"
   workflow_dispatch: {}
 
 jobs:
