@@ -49,15 +49,12 @@ class SignalResult:
     vol: float
     vol_avg20: float
     rvol: float
-    rvol_label: str
-    filter_label: str
     special_label: str
     priority_level: int
     rs_score: float
     is_weekly_ok: bool
     w_weeks: int
     spread: float
-    warning: str
     reason: str
 
 @dataclass(frozen=True)
@@ -146,48 +143,20 @@ def calculate_rs_score(stock_df: pd.DataFrame, index_df: pd.DataFrame) -> float:
     if s_50 == 0 or i_50 == 0: return 0.0
     return (s_now / s_50) / (i_now / i_50)
 
-# --- MARKET PROTECTIONS ---
-
-async def check_market_kill_switch(sources: List[str], tickers: List[str], timeout: int) -> Tuple[bool, str]:
-    log("INFO", "Kiểm tra Market Kill Switch...")
-    # 1. VNINDEX Check
-    idx_df, _ = await asyncio.to_thread(load_history_with_fallback, "VNINDEX", sources, 50)
-    if not idx_df.empty and len(idx_df) >= 2:
-        idx_df["rsi"] = rsi(idx_df["close"], 14)
-        last, prev = idx_df.iloc[-1], idx_df.iloc[-2]
-        pct = (last["close"]/prev["close"] - 1)*100
-        rsi_drop = prev["rsi"] - last["rsi"]
-        if pct < -2.0 or rsi_drop > 5.0:
-            return True, f"🚨 THỊ TRƯỜNG NGUY HIỂM: VNINDEX giảm {pct:.2f}% | RSI rơi {rsi_drop:.2f}đ"
-            
-    # 2. Breadth Check (Giảm sàn diện rộng)
-    log("INFO", "Kiểm tra độ rộng thị trường...")
-    floor_count = 0
-    for sym in tickers[:30]: # Quét nhanh 30 mã đại diện
-        df, _ = await asyncio.to_thread(load_history_with_fallback, sym, sources, 2)
-        if not df.empty and len(df) >= 2:
-            pct = (df["close"].iloc[-1]/df["close"].iloc[-2] - 1)*100
-            if pct <= -6.8: floor_count += 1
-    
-    if floor_count >= 3:
-        return True, f"💀 CẢNH BÁO SẬP DIỆN RỘNG: Phát hiện {floor_count} mã giảm sàn trong nhóm dẫn dắt."
-        
-    return False, ""
-
 # --- CORE EVALUATION V10 ---
 
-def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int = 260, **kwargs) -> EvalOutcome:
+def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int = 220, **kwargs) -> EvalOutcome:
     df, used_source = load_history_with_fallback(symbol, sources, length)
     if not used_source: return EvalOutcome(symbol, exchange, "", "không lấy được dữ liệu", None)
-    if len(df) < 220: return EvalOutcome(symbol, exchange, "", "thiếu dữ liệu MA200", None)
+    if len(df) < 200: return EvalOutcome(symbol, exchange, "", "thiếu dữ liệu", None)
     
     df = calc_indicators(df)
     last, prev = df.iloc[-1], df.iloc[-2]
     
     vol_avg20 = float(last["vol_avg20_prev"])
-    if vol_avg20 <= 200_000: return EvalOutcome(symbol, exchange, "", f"thanh khoản thấp ({vol_avg20:.0f})", None)
+    if vol_avg20 <= 200_000: return EvalOutcome(symbol, exchange, "", f"thanh khoản thấp", None)
     
-    o, h, l, c = float(last["open"]), float(last["high"]), float(last["low"]), float(last["close"])
+    h, l, c = float(last["high"]), float(last["low"]), float(last["close"])
     pc = float(prev["close"])
     perf_today = last["perf"]
     rvol = float(last["volume"] / vol_avg20) if vol_avg20 > 0 else 0
@@ -196,52 +165,66 @@ def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int 
     candle_spread = (h - l) / pc * 100 if pc > 0 else 0
     ma20_distance_pct = (c / last["ma20"] - 1) * 100
     
-    info_line = f"{symbol}: Giá={c:.2f}, RS={rs_score:.2f}, RVOL={rvol:.2f}, Perf={perf_today:.2f}%"
+    info_line = f"{symbol}: RS={rs_score:.2f}, RVOL={rvol:.2f}, Perf={perf_today:.2f}%"
 
     priority_level = 4
     priority_label = ""
 
+    # PHÂN LOẠI CHI TIẾT THEO V10
     if is_weekly_ok:
         if rs_score < 1.15:
             if perf_today > 3.0: priority_label, priority_level = "⚠️ NỔ GIẢ (RS THẤP)", 3
             else: priority_label, priority_level = "💤 CHỜ DÒNG TIỀN", 4
+        
+        # Nhóm Rũ bỏ
         elif rs_score > 1.3 and perf_today < 0:
-            if perf_today < -2.5 and rvol > 0.8: priority_label, priority_level = "👀 THEO DÕI THÊM", 4
+            if perf_today < -2.5:
+                if rvol > 0.8: priority_label, priority_level = "👀 THEO DÕI THÊM", 4
+                else: priority_label, priority_level = "💎 RŨ BỎ CHUẨN (MUA GOM)", 1
             elif rvol < 0.8: priority_label, priority_level = "💎 RŨ BỎ CHUẨN (MUA GOM)", 1
-            elif -2.0 < perf_today < 0 and 0.8 <= rvol < 1.1: priority_label, priority_level = "🔥 RŨ BỎ LINH HOẠT", 1
+            elif -2.0 < perf_today < 0 and 0.8 <= rvol < 1.1:
+                priority_label, priority_level = "🔥 RŨ BỎ LINH HOẠT", 1
+            else:
+                priority_label, priority_level = "💎 RŨ BỎ KỸ THUẬT", 2
+        
+        # Nhóm Điểm nổ
         elif perf_today > 2.0 and rvol > 1.5:
             if rs_score > 1.5: priority_label, priority_level = "🚀 SIÊU CỔ XÁC NHẬN NỔ", 1
             else: priority_label, priority_level = "🚀 XÁC NHẬN ĐIỂM NỔ", 2
+        
+        # Nhóm Cạn cung / Kiệt Vol
         elif abs(perf_today) < 1.0 and rvol < 0.8:
             if rs_score >= 1.35: priority_label, priority_level = "🚀 CẠN CUNG BỨT PHÁ", 1
-            else: priority_label, priority_level = "🚀 CẠN CUNG BỨT PHÁ", 3
-        elif abs(perf_today) < 1.0 and rvol < 0.6:
-            priority_label, priority_level = "💤 TÍCH LŨY KIỆT VOL", 2
+            else: priority_label, priority_level = "💤 TÍCH LŨY KIỆT VOL", 2
+            
+        # Nền dài
         elif 1.2 <= rs_score < 1.25 and w_weeks >= 4 and rvol < 0.8:
             priority_label, priority_level = "💎 GOM HÀNG NỀN DÀI", 2
+            
+        # Dòng tiền đột biến
         elif 1.15 <= rs_score < 1.25 and rvol > 2.5:
             priority_label, priority_level = "🚀 DÒNG TIỀN ĐỘT BIẾN (HẠNG 2)", 2
 
-    # CHẶN BẪY
+    # CHẶN BẪY RỦI RO
     if rvol > 5.0: priority_label, priority_level = "⚠️ CAO TRÀO MUA (RỦI RO)", 3
     elif candle_spread > 8.0 and rvol > 1.8: priority_label, priority_level = "⚠️ BIẾN ĐỘNG LỎNG (RỦI RO)", 3
     elif rs_score > 2.0 and ma20_distance_pct > 20.0: priority_label, priority_level = "⚠️ QUÁ MUA (KHÔNG ĐU)", 3
     elif abs(ma20_distance_pct) > 15.0 and rs_score <= 1.5: priority_label, priority_level = "⚠️ QUÁ ĐIỂM MUA", 3
 
-    if not priority_label: priority_label, priority_level = "👀 THEO DÕI THÊM", 4
-    
-    reason = f"P{priority_level} | RS={rs_score:.2f} | W={is_weekly_ok} | RVOL={rvol:.2f}"
+    if not priority_label:
+        priority_label, priority_level = "👀 THEO DÕI THÊM", 4
     
     sig = SignalResult(
         symbol=symbol, exchange=exchange, close=c, pct_change=perf_today,
         rsi14=last["rsi14"], ma20=last["ma20"], ma50=last["ma50"], ma200=last["ma200"],
         ma20_distance_pct=ma20_distance_pct, vol=last["volume"], vol_avg20=vol_avg20,
-        rvol=rvol, rvol_label="", filter_label="", special_label=priority_label,
-        priority_level=priority_level, rs_score=rs_score, is_weekly_ok=is_weekly_ok,
-        w_weeks=w_weeks, spread=candle_spread, warning="", reason=reason
+        rvol=rvol, special_label=priority_label, priority_level=priority_level,
+        rs_score=rs_score, is_weekly_ok=is_weekly_ok, w_weeks=w_weeks, spread=candle_spread,
+        reason=f"P{priority_level}"
     )
     
-    return EvalOutcome(symbol, exchange, info_line, "", sig if priority_level <= 2 else None)
+    # TRẢ VỀ KẾT QUẢ CHO TẤT CẢ P1, P2, P3 ĐỂ KHỚP VỚI BACKTEST
+    return EvalOutcome(symbol, exchange, info_line, "", sig if priority_level <= 3 else None)
 
 # --- BOT INTERFACE ---
 
@@ -250,14 +233,14 @@ def format_telegram_message(results: List[SignalResult], scanned: int, source: s
     header += f"<i>Universe: VN100 | Quét: {scanned} mã | Nguồn: {source}</i>\n\n"
     
     lines = [header]
-    for r in sorted(results, key=lambda x: x.priority_level):
-        emoji = "🚀" if r.priority_level == 1 else "💎"
+    for r in sorted(results, key=lambda x: (x.priority_level, -x.rs_score)):
+        emoji = "🚀" if r.priority_level == 1 else ("💎" if r.priority_level == 2 else "⚠️")
         msg = (
             f"{emoji} <b>{r.symbol}</b> | {r.special_label}\n"
             f"───────────────────\n"
             f"💰 Giá: <b>{r.close:,.2f}</b> ({r.pct_change:+.2f}%)\n"
             f"📊 RS: <b>{r.rs_score:.2f}</b> | RVOL: <b>{r.rvol:.2f}</b>\n"
-            f"📏 Spread: <b>{r.spread:.2f}%</b> | MA20: <b>{r.ma20:.2f}</b>\n"
+            f"📏 Spread: <b>{r.spread:.2f}%</b> | MA20: <b>{r.ma20:,.2f}</b>\n"
             f"📍 Cách MA20: <b>{r.ma20_distance_pct:+.2f}%</b> | Tuần: {'✅' if r.is_weekly_ok else '❌'} ({r.w_weeks}w)\n"
             f"───────────────────\n"
         )
@@ -270,39 +253,31 @@ async def scan_once_and_send():
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     sources = ["KBS", "VCI", "TCBS", "SSI"]
     
-    log("INFO", "Bắt đầu quét V10 chuyên sâu...")
+    log("INFO", "Bắt đầu quét V10 chuyên sâu (Sync with Backtest)...")
     
-    # 1. Kill Switch Check
-    is_killed, kill_msg = await check_market_kill_switch(sources, VN100_TICKERS, 30)
-    if is_killed:
-        log("KILL", kill_msg)
-        await send_telegram_message(token, chat_id, f"⚠️ <b>DỪNG QUÉT KHẨN CẤP</b>\n\n{kill_msg}")
-        return
-
-    # 2. RS Ranking
-    index_df, _ = await asyncio.to_thread(load_history_with_fallback, "VNINDEX", sources, 60)
+    # RS Ranking (Dùng 220 phiên như Backtest)
+    idx_df, _ = await asyncio.to_thread(load_history_with_fallback, "VNINDEX", sources, 220)
     rs_results = []
     for t in VN100_TICKERS:
-        df_t, _ = await asyncio.to_thread(load_history_with_fallback, t, sources, 60)
-        rs_results.append((t, calculate_rs_score(df_t, index_df)))
+        df_t, _ = await asyncio.to_thread(load_history_with_fallback, t, sources, 220)
+        rs_results.append((t, calculate_rs_score(df_t, idx_df)))
         await asyncio.sleep(0.4)
     
     rs_results.sort(key=lambda x: x[1], reverse=True)
-    top_20_tickers = {x[0] for x in rs_results[:20]}
+    top_20_count = int(len(VN100_TICKERS) * 0.2)
+    top_20_tickers = {x[0] for x in rs_results[:top_20_count]}
     rs_map = {x[0]: x[1] for x in rs_results}
     
     results = []
-    scanned_count = 0
     for t in VN100_TICKERS:
         if t not in top_20_tickers: continue
-        scanned_count += 1
         log("SCAN", f"Đang phân tích {t}...")
         outcome = await asyncio.to_thread(evaluate_symbol, t, "VN100", sources, rs_score=rs_map.get(t,0))
         if outcome.signal: results.append(outcome.signal)
         await asyncio.sleep(1.2)
         
     if results:
-        msg = format_telegram_message(results, len(VN100_TICKERS), ",".join(sources))
+        msg = format_telegram_message(results, len(VN100_TICKERS), "VN100")
         await send_telegram_message(token, chat_id, msg)
         log("INFO", f"Gửi {len(results)} tín hiệu thành công.")
     else:
@@ -313,38 +288,11 @@ async def send_telegram_message(token, chat_id, text):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     try: requests.post(url, json=payload, timeout=15)
-    except Exception as e: log("ERROR", f"Lỗi gửi Telegram: {e}")
-
-# --- BOT HANDLERS ---
-
-async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Bot V10 đang hoạt động. Sử dụng /scan để quét ngay.")
-
-async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔄 Đang bắt đầu quét VN100 chuẩn V10. Vui lòng đợi...")
-    await scan_once_and_send()
-
-# --- MAIN ENTRY ---
+    except: pass
 
 async def main():
     load_dotenv()
-    token = os.getenv("TELEGRAM_TOKEN")
-    scan_once = os.getenv("SCAN_ONCE", "0") == "1"
-
-    if scan_once:
-        await scan_once_and_send()
-        return
-
-    app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler("test", cmd_test))
-    app.add_handler(CommandHandler("scan", cmd_scan))
-    
-    log("INFO", "Bot V10 đã sẵn sàng (Long-running mode).")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    
-    while True: await asyncio.sleep(3600)
+    await scan_once_and_send()
 
 if __name__ == "__main__":
     asyncio.run(main())
