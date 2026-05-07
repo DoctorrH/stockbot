@@ -34,14 +34,14 @@ VN100_TICKERS = [
 ]
 
 SECTORS = {
-    "BANK": ["ACB", "BID", "CTG", "HDB", "MBB", "SHB", "SSB", "STB", "TCB", "TPB", "VCB", "VIB", "VPB", "EIB", "MSB", "OCB", "LPB"],
-    "SECURITIES": ["SSI", "VCI", "VND", "HCM", "VIX", "FTS", "BSI", "ORS", "VDS"],
-    "STEEL": ["HPG", "HSG", "NKG", "SMC", "TLH"],
-    "REAL_ESTATE": ["VIC", "VHM", "VRE", "NVL", "PDR", "DIG", "DXG", "KBC", "KDH", "NLG", "SCR", "IJC", "TCH"],
-    "RETAIL": ["MWG", "PNJ", "FRT", "DGW", "PET"],
-    "TECH_TELECOM": ["FPT", "CMG", "LCG", "CTR", "VGI"],
-    "ENERGY_OIL": ["GAS", "PLX", "POW", "PVD", "PVS", "PVT", "BSR"],
-    "CHEMICAL_FERTILIZER": ["DGC", "DCM", "DPM", "BFC", "CSV"],
+    "Ngân hàng": ["ACB", "BID", "CTG", "HDB", "MBB", "SHB", "SSB", "STB", "TCB", "TPB", "VCB", "VIB", "VPB", "EIB", "MSB", "OCB", "LPB"],
+    "Chứng khoán": ["SSI", "VCI", "VND", "HCM", "VIX", "FTS", "BSI", "ORS", "VDS"],
+    "Thép": ["HPG", "HSG", "NKG", "SMC", "TLH"],
+    "Bất động sản": ["VIC", "VHM", "VRE", "NVL", "PDR", "DIG", "DXG", "KBC", "KDH", "NLG", "SCR", "IJC", "TCH"],
+    "Bán lẻ": ["MWG", "PNJ", "FRT", "DGW", "PET"],
+    "Công nghệ & Viễn thông": ["FPT", "CMG", "LCG", "CTR", "VGI"],
+    "Dầu khí": ["GAS", "PLX", "POW", "PVD", "PVS", "PVT", "BSR"],
+    "Hóa chất & Phân bón": ["DGC", "DCM", "DPM", "BFC", "CSV"],
 }
 
 STRATEGY_MAP = {
@@ -83,6 +83,7 @@ class SignalResult:
     trend_type: str
     sector_name: str
     recommended_size: str
+    stop_loss_price: float
     reason: str
 
 @dataclass(frozen=True)
@@ -324,6 +325,17 @@ def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int 
         else:
             recommended_size = "ĐÁNH NHỎ (Dưới 15%) - Đi ngược bầy đàn, rủi ro T+"
 
+    # TÍNH GIÁ CẮT LỖ (Stop Loss)
+    sl_price = 0.0
+    if label == "💎 RŨ BỎ CHUẨN (MUA GOM)":
+        sl_price = last["ma50"]
+    elif label == "🚀 XÁC NHẬN ĐIỂM NỔ":
+        sl_price = c - (h - l) * 0.5
+    elif label == "🔥 RŨ BỎ LINH HOẠT":
+        sl_price = c * 0.96
+    elif priority <= 2:
+        sl_price = c * 0.93
+
     if not label: label, priority = "👀 THEO DÕI THÊM", 4
     
     # PHÂN LOẠI CẤU TRÚC XU HƯỚNG (Ngắn hạn vs Trung/Dài hạn)
@@ -347,6 +359,7 @@ def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int 
         trend_type=trend_type,
         sector_name=sector_name,
         recommended_size=recommended_size,
+        stop_loss_price=sl_price,
         reason=f"P{priority}"
     )
     
@@ -377,6 +390,8 @@ def format_telegram_message(results: List[SignalResult], scanned: int, source: s
             safe_size = html.escape(r.recommended_size)
             safe_strategy = html.escape(strategy)
             
+            sl_val = f"{r.stop_loss_price:,.2f}" if r.stop_loss_price > 0 else "Theo cấu trúc"
+            
             msg = (
                 f"{emoji} <b>{r.symbol}</b> ({html.escape(r.sector_name)}) | {safe_label}\n"
                 f"───────────────────\n"
@@ -385,6 +400,7 @@ def format_telegram_message(results: List[SignalResult], scanned: int, source: s
                 f"📍 Cách MA20: <b>{r.ma20_distance_pct:+.2f}%</b> | Cấu trúc: <b>{safe_trend}</b>\n"
                 f"⚖️ Tỷ trọng: <b>{safe_size}</b>\n"
                 f"💡 Hành động: <b>{safe_strategy}</b>\n"
+                f"🛡️ Cắt lỗ tại: <b>{sl_val}</b>\n"
                 f"───────────────────\n"
             )
             lines.append(msg)
