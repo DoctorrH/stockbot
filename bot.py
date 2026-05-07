@@ -32,6 +32,31 @@ VN100_TICKERS = [
     "TLG", "VCG", "VCI", "VDS", "VGC", "VHC", "VIX", "VPI", "VSH", "KSB",
 ]
 
+SECTORS = {
+    "BANK": ["ACB", "BID", "CTG", "HDB", "MBB", "SHB", "SSB", "STB", "TCB", "TPB", "VCB", "VIB", "VPB", "EIB", "MSB", "OCB", "LPB"],
+    "SECURITIES": ["SSI", "VCI", "VND", "HCM", "VIX", "FTS", "BSI", "ORS", "VDS"],
+    "STEEL": ["HPG", "HSG", "NKG", "SMC", "TLH"],
+    "REAL_ESTATE": ["VIC", "VHM", "VRE", "NVL", "PDR", "DIG", "DXG", "KBC", "KDH", "NLG", "SCR", "IJC", "TCH"],
+    "RETAIL": ["MWG", "PNJ", "FRT", "DGW", "PET"],
+    "TECH_TELECOM": ["FPT", "CMG", "LCG", "CTR", "VGI"],
+    "ENERGY_OIL": ["GAS", "PLX", "POW", "PVD", "PVS", "PVT", "BSR"],
+    "CHEMICAL_FERTILIZER": ["DGC", "DCM", "DPM", "BFC", "CSV"],
+}
+
+STRATEGY_MAP = {
+    "💎 RŨ BỎ CHUẨN (MUA GOM)": "Mua gom 30-50% vị thế. Cắt lỗ nếu đóng cửa thủng MA50.",
+    "🔥 RŨ BỎ LINH HOẠT": "Mua test 30% vị thế quanh nền. Hàng về lỗ > 4% cắt dứt khoát.",
+    "💎 RŨ BỎ KỸ THUẬT": "Mua thăm dò tỷ trọng nhỏ. Đợi Vol nổ để gia tăng.",
+    "🔥 SIÊU CỔ ĐANG CHẠY": "Nắm giữ chặt. Trailing stop (chặn lãi) theo MA10 hoặc đáy nến tuần.",
+    "🚀 XÁC NHẬN ĐIỂM NỔ": "Mua đủ vị thế (Full size). Cắt lỗ khi thủng nửa cây nến bùng nổ.",
+    "🚀 CẠN CUNG BỨT PHÁ": "Mua 50% gia tăng. Đợi dòng tiền lớn xác nhận vượt đỉnh.",
+    "💤 TÍCH LŨY KIỆT VOL": "Nằm vùng 20-30% vốn. Tuyệt đối không mua đuổi giá xanh.",
+    "💎 GOM HÀNG NỀN DÀI": "Gom dần từng phần theo biên dưới của nền. Kiên nhẫn nắm giữ.",
+    "🚀 DÒNG TIỀN ĐỘT BIẾN (HẠNG 2)": "Đánh T+ tỷ trọng vừa phải. Chốt lời chủ động khi rướn giá.",
+    "⚠️ MẤT GIA TỐC TĂNG": "Dừng mua mới. Sẵn sàng chốt lời 1/2 nếu thủng MA20.",
+    "👀 THỊ TRƯỜNG XẤU (ĐỨNG NGOÀI)": "Rủi ro hệ thống. Ôm tiền mặt, không bắt dao rơi."
+}
+
 # --- MODELS ---
 
 @dataclass(frozen=True)
@@ -54,6 +79,9 @@ class SignalResult:
     is_weekly_ok: bool
     w_weeks: int
     spread: float
+    trend_type: str
+    sector_name: str
+    recommended_size: str
     reason: str
 
 @dataclass(frozen=True)
@@ -126,26 +154,63 @@ def check_weekly_status(df: pd.DataFrame, target_date: Optional[datetime] = None
         else: break
     return is_above, consecutive
 
-def calculate_rs_score(stock_df: pd.DataFrame, index_df: pd.DataFrame) -> float:
-    if stock_df.empty or index_df.empty or len(stock_df) < 50 or len(index_df) < 50: return 0.0
+def calculate_rs_score(stock_df: pd.DataFrame, index_df: pd.DataFrame) -> Tuple[float, float]:
+    if stock_df.empty or index_df.empty or len(stock_df) < 55 or len(index_df) < 55: 
+        return 0.0, 0.0
+    
+    # RS Today (Tỷ lệ thay đổi 50 phiên của Cổ phiếu / Chỉ số)
     s_now, s_50 = stock_df["close"].iloc[-1], stock_df["close"].iloc[-50]
     i_now, i_50 = index_df["close"].iloc[-1], index_df["close"].iloc[-50]
-    if s_50 == 0 or i_50 == 0: return 0.0
-    return (s_now / s_50) / (i_now / i_50)
+    rs_today = (s_now / s_50) / (i_now / i_50) if (s_50 != 0 and i_50 != 0) else 0.0
+    
+    # RS 5 days ago (Tỷ lệ thay đổi 50 phiên kết thúc cách đây 5 ngày)
+    s_5, s_55 = stock_df["close"].iloc[-6], stock_df["close"].iloc[-55]
+    i_5, i_55 = index_df["close"].iloc[-6], index_df["close"].iloc[-55]
+    rs_5_ago = (s_5 / s_55) / (i_5 / i_55) if (s_55 != 0 and i_55 != 0) else 0.0
+    
+    rs_momentum = rs_today - rs_5_ago
+    return rs_today, rs_momentum
+
+def calculate_sector_rs(rs_map: dict) -> dict:
+    sector_scores = {}
+    for sector, tickers in SECTORS.items():
+        # rs_map lưu dạng {ticker: (rs_score, rs_momentum)}
+        scores = [rs_map[t][0] for t in tickers if t in rs_map]
+        if scores:
+            sector_scores[sector] = sum(scores) / len(scores)
+        else:
+            sector_scores[sector] = 1.0
+    return sector_scores
 
 # --- MARKET PROTECTIONS ---
 
-async def check_market_kill_switch(sources: List[str], tickers: List[str]) -> Tuple[bool, str]:
-    log("INFO", "Kiểm tra Market Kill Switch...")
+async def check_market_kill_switch(sources: List[str], tickers: List[str]) -> Tuple[bool, str, bool]:
+    log("INFO", "Kiểm tra trạng thái thị trường VNINDEX...")
     idx_df, _ = await asyncio.to_thread(load_history_with_fallback, "VNINDEX", sources, 50)
-    if not idx_df.empty and len(idx_df) >= 2:
-        idx_df["rsi"] = rsi(idx_df["close"], 14)
-        last, prev = idx_df.iloc[-1], idx_df.iloc[-2]
-        pct = (last["close"]/prev["close"] - 1)*100
-        rsi_drop = prev["rsi"] - last["rsi"]
-        if pct < -2.0 or rsi_drop > 5.0:
-            return True, f"🚨 VNINDEX giảm {pct:.2f}% | RSI rơi {rsi_drop:.2f}đ"
-    return False, ""
+    if idx_df.empty or len(idx_df) < 20:
+        return False, "Không lấy được dữ liệu VNINDEX", False
+        
+    idx_df["ma20"] = sma(idx_df["close"], 20)
+    idx_df["rsi"] = rsi(idx_df["close"], 14)
+    last, prev = idx_df.iloc[-1], idx_df.iloc[-2]
+    
+    pct = (last["close"]/prev["close"] - 1)*100
+    rsi_drop = prev["rsi"] - last["rsi"]
+    is_weak = last["close"] < last["ma20"]
+    
+    # Tạo nội dung thông báo tình hình VNINDEX
+    status_msg = f"VNINDEX: {last['close']:,.2f} ({pct:+.2f}%) | RSI: {last['rsi']:.1f} | MA20: {last['ma20']:,.2f}"
+    if is_weak:
+        status_msg += "\n⚠️ <b>CẢNH BÁO:</b> Thị trường yếu (Dưới MA20). Ưu tiên hạ tỷ trọng giải ngân!"
+    else:
+        status_msg += "\n✅ <b>Trạng thái:</b> Thị trường khỏe (Trên MA20)."
+
+    # Logic Kill Switch (Dừng khẩn cấp)
+    if pct < -2.0 or rsi_drop > 5.0:
+        kill_reason = f"🚨 VNINDEX GIẢM MẠNH ({pct:.2f}%) hoặc RSI RƠI SỐC ({rsi_drop:.2f}đ)."
+        return True, kill_reason, is_weak
+        
+    return False, status_msg, is_weak
 
 # --- CORE EVALUATION (COPIED LOGIC FROM BACKTEST) ---
 
@@ -170,12 +235,26 @@ def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int 
     perf_today = float(last["perf"])
     vol_avg20 = float(last["vol_avg20"])
     rvol = float(last["volume"] / vol_avg20) if vol_avg20 > 0 else 0
+    
+    # Các tham số nâng cấp
     rs_score = kwargs.get("rs_score", 0.0)
+    rs_momentum = kwargs.get("rs_momentum", 0.0)
+    is_market_downtrend = kwargs.get("is_market_downtrend", False)
+    
+    # Logic Sóng ngành & Tỷ trọng
+    sector_name = "KHÁC"
+    for s, t_list in SECTORS.items():
+        if symbol in t_list:
+            sector_name = s
+            break
+    
+    sector_rs = kwargs.get("sector_rs_map", {}).get(sector_name, 1.0)
+    
     is_weekly_ok, w_weeks = check_weekly_status(df)
     candle_spread = (h - l) / pc * 100 if pc > 0 else 0
     ma20_distance_pct = (c / last["ma20"] - 1) * 100
     
-    info_line = f"{symbol}: Giá={c:.2f}, RS={rs_score:.2f}, RVOL={rvol:.2f}"
+    info_line = f"{symbol}: Giá={c:.2f}, RS={rs_score:.2f}, Momentum={rs_momentum:.3f}"
 
     label = ""
     priority = 4
@@ -186,21 +265,33 @@ def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int 
             if perf_today > 3.0: label, priority = "⚠️ NỔ GIẢ (RS THẤP)", 3
             else: label, priority = "💤 CHỜ DÒNG TIỀN", 4
         
-        # 2. RŨ BỎ (SHAKEOUT)
+        # 2. RŨ BỎ (SHAKEOUT) - Bổ sung MA50
         elif rs_score > 1.3 and perf_today < 0:
-            if perf_today < -2.5 and rvol > 0.8: label, priority = "👀 THEO DÕI THÊM", 4
-            elif rvol < 0.8: label, priority = "💎 RŨ BỎ CHUẨN (MUA GOM)", 1
-            elif -2.0 < perf_today < 0 and 0.8 <= rvol < 1.1: label, priority = "🔥 RŨ BỎ LINH HOẠT", 1
-            else: label, priority = "💎 RŨ BỎ KỸ THUẬT", 2
+            # Giá phải nằm trên MA50 mới được tính là rũ bỏ an toàn
+            if c < last["ma50"]: 
+                label, priority = "👀 GÃY NỀN TRUNG HẠN", 4
+            elif perf_today < -2.5 and rvol > 0.8: 
+                label, priority = "👀 THEO DÕI THÊM", 4
+            elif rvol < 0.8: 
+                label, priority = "💎 RŨ BỎ CHUẨN (MUA GOM)", 1
+            elif -2.0 < perf_today < 0 and 0.8 <= rvol < 1.1: 
+                label, priority = "🔥 RŨ BỎ LINH HOẠT", 1
+            else: 
+                label, priority = "💎 RŨ BỎ KỸ THUẬT", 2
 
         # 3. SIÊU CỔ ĐANG CHẠY
         elif rs_score > 1.5:
-            if perf_today >= -2.0: label, priority = "🔥 SIÊU CỔ ĐANG CHẠY", 1
+            if perf_today >= -2.0: 
+                label, priority = "🔥 SIÊU CỔ ĐANG CHẠY", 1
+                if rs_momentum <= 0: label, priority = "⚠️ MẤT GIA TỐC TĂNG", 3
         
         # 4. ĐIỂM NỔ & CẠN CUNG
         elif 1.25 <= rs_score <= 1.5:
-            if perf_today > 2.0 and rvol > 1.5: label, priority = "🚀 XÁC NHẬN ĐIỂM NỔ", 1
-            elif perf_today > 2.0 and rvol < 1.0: label, priority = "🚀 CẠN CUNG BỨT PHÁ", 1 if rs_score >= 1.35 else 3
+            if perf_today > 2.0 and rvol > 1.5: 
+                label, priority = "🚀 XÁC NHẬN ĐIỂM NỔ", 1
+                if rs_momentum <= 0: label, priority = "⚠️ MẤT GIA TỐC TĂNG", 3
+            elif perf_today > 2.0 and rvol < 1.0: 
+                label, priority = "🚀 CẠN CUNG BỨT PHÁ", 1 if rs_score >= 1.35 else 3
             elif abs(perf_today) < 1.0 and rvol < 0.8: label, priority = "💤 TÍCH LŨY KIỆT VOL", 2
         
         # 5. NỀN DÀI & DÒNG TIỀN ĐỘT BIẾN
@@ -216,14 +307,45 @@ def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int 
     if rs_score > 2.0 and ma20_distance_pct > 20.0: label, priority = "⚠️ QUÁ MUA (KHÔNG ĐU)", 3
     elif ma20_distance_pct > 15.0 and rs_score <= 1.5: label, priority = "⚠️ QUÁ ĐIỂM MUA", 3
 
+    # BẢO VỆ RỦI RO HỆ THỐNG: Thị trường xấu (Downtrend MA20)
+    if is_market_downtrend and priority == 1:
+        # Ngoại lệ: Chỉ giữ lại Priority 1 nếu là RŨ BỎ CHUẨN và giá vẫn > MA50
+        if label == "💎 RŨ BỎ CHUẨN (MUA GOM)" and c > last["ma50"]:
+            pass # Giữ nguyên Priority 1
+        else:
+            label, priority = "👀 THỊ TRƯỜNG XẤU (ĐỨNG NGOÀI)", 4
+
+    # QUẢN TRỊ TỶ TRỌNG VỐN (Recommended Size)
+    recommended_size = "Quan sát (0%)"
+    if priority in [1, 2]:
+        if sector_rs >= 1.05:
+            recommended_size = "ĐÁNH LỚN (30-50%) - Có sóng ngành bảo kê"
+        else:
+            recommended_size = "ĐÁNH NHỎ (<15%) - Đi ngược bầy đàn, rủi ro T+"
+
     if not label: label, priority = "👀 THEO DÕI THÊM", 4
     
+    # PHÂN LOẠI CẤU TRÚC XU HƯỚNG (Ngắn hạn vs Trung/Dài hạn)
+    trend_type = "📉 CHƯA RÕ XU HƯỚNG"
+    m20 = last["ma20"]
+    m50 = last["ma50"]
+    m200 = df["ma200"].iloc[-1]
+    
+    if c > m20:
+        if m20 > m50 > m200 and w_weeks >= 4:
+            trend_type = "📈 FORM TRUNG DÀI HẠN"
+        else:
+            trend_type = "⚡ FORM ĐÁNH NGẮN (T+)"
+
     sig = SignalResult(
         symbol=symbol, exchange=exchange, close=c, pct_change=perf_today,
         rsi14=last["rsi14"], ma20=last["ma20"], ma50=last["ma50"], ma200=df["ma200"].iloc[-1],
         ma20_distance_pct=ma20_distance_pct, vol=last["volume"], vol_avg20=vol_avg20,
         rvol=rvol, special_label=label, priority_level=priority,
         rs_score=rs_score, is_weekly_ok=is_weekly_ok, w_weeks=w_weeks, spread=candle_spread,
+        trend_type=trend_type,
+        sector_name=sector_name,
+        recommended_size=recommended_size,
         reason=f"P{priority}"
     )
     
@@ -231,23 +353,34 @@ def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int 
 
 # --- BOT INTERFACE ---
 
-def format_telegram_message(results: List[SignalResult], scanned: int, source: str) -> str:
+def format_telegram_message(results: List[SignalResult], scanned: int, source: str, market_info: str = "", top_sectors_info: str = "") -> str:
     header = f"<b>🚀 STOCK BOT V10 - SCAN {datetime.now().strftime('%d/%m %H:%M')}</b>\n"
-    header += f"<i>Universe: VN100 | Quét: {scanned} mã | Nguồn: {source}</i>\n\n"
+    header += f"<i>Universe: VN100 | Quét: {scanned} mã | Nguồn: {source}</i>\n"
+    if market_info:
+        header += f"───────────────────\n📊 <b>Tình hình VN-Index:</b>\n{market_info}\n"
+    if top_sectors_info:
+        header += f"───────────────────\n🔥 <b>TOP 3 NGÀNH DẪN DẮT:</b>\n{top_sectors_info}\n"
+    header += "───────────────────\n\n"
     
     lines = [header]
-    for r in sorted(results, key=lambda x: (x.priority_level, -x.rs_score)):
-        emoji = "🚀" if r.priority_level == 1 else ("💎" if r.priority_level == 2 else "⚠️")
-        msg = (
-            f"{emoji} <b>{r.symbol}</b> | {r.special_label}\n"
-            f"───────────────────\n"
-            f"💰 Giá: <b>{r.close:,.2f}</b> ({r.pct_change:+.2f}%)\n"
-            f"📊 RS: <b>{r.rs_score:.2f}</b> | RVOL: <b>{r.rvol:.2f}</b>\n"
-            f"📏 Spread: <b>{r.spread:.2f}%</b> | MA20: <b>{r.ma20:,.2f}</b>\n"
-            f"📍 Cách MA20: <b>{r.ma20_distance_pct:+.2f}%</b> | Tuần: {'✅' if r.is_weekly_ok else '❌'} ({r.w_weeks}w)\n"
-            f"───────────────────\n"
-        )
-        lines.append(msg)
+    if not results:
+        lines.append("📭 <i>Không tìm thấy mã nào đạt tiêu chuẩn trong phiên này.</i>")
+    else:
+        for r in sorted(results, key=lambda x: (x.priority_level, -x.rs_score)):
+            emoji = "🚀" if r.priority_level == 1 else ("💎" if r.priority_level == 2 else "⚠️")
+            strategy = STRATEGY_MAP.get(r.special_label, "Quan sát rủi ro, không mở vị thế mua mới.")
+            
+            msg = (
+                f"{emoji} <b>{r.symbol}</b> ({r.sector_name}) | {r.special_label}\n"
+                f"───────────────────\n"
+                f"💰 Giá: <b>{r.close:,.2f}</b> ({r.pct_change:+.2f}%)\n"
+                f"📊 RS Mã: <b>{r.rs_score:.2f}</b> | RVOL: <b>{r.rvol:.2f}</b>\n"
+                f"📍 Cách MA20: <b>{r.ma20_distance_pct:+.2f}%</b> | Cấu trúc: <b>{r.trend_type}</b>\n"
+                f"⚖️ Tỷ trọng: <b>{r.recommended_size}</b>\n"
+                f"💡 Hành động: <b>{strategy}</b>\n"
+                f"───────────────────\n"
+            )
+            lines.append(msg)
     return "".join(lines)
 
 async def scan_once_and_send():
@@ -258,37 +391,57 @@ async def scan_once_and_send():
     
     log("INFO", "Bắt đầu quét V10 (Logic 1:1 từ Backtest)...")
     
-    # 1. Kill Switch
-    is_killed, kill_msg = await check_market_kill_switch(sources, VN100_TICKERS)
+    # 1. Kiểm tra trạng thái thị trường & Kill Switch (Đèn giao thông)
+    is_killed, market_msg, is_market_downtrend = await check_market_kill_switch(sources, VN100_TICKERS)
     if is_killed:
-        log("KILL", kill_msg)
-        await send_telegram_message(token, chat_id, f"⚠️ <b>DỪNG QUÉT KHẨN CẤP</b>\n\n{kill_msg}")
+        log("KILL", market_msg)
+        await send_telegram_message(token, chat_id, f"⚠️ <b>DỪNG QUÉT KHẨN CẤP</b>\n\n<b>Lý do:</b> {market_msg}")
         return
 
-    # 2. RS Ranking (220 phiên)
+    # 2. RS Ranking & Momentum (220 phiên)
     idx_df, _ = await asyncio.to_thread(load_history_with_fallback, "VNINDEX", sources, 220)
     rs_results = []
     for t in VN100_TICKERS:
         df_t, _ = await asyncio.to_thread(load_history_with_fallback, t, sources, 220)
-        rs_results.append((t, calculate_rs_score(df_t, idx_df)))
+        score, momentum = calculate_rs_score(df_t, idx_df)
+        rs_results.append((t, score, momentum))
         await asyncio.sleep(0.4)
     
     rs_results.sort(key=lambda x: x[1], reverse=True)
     top_20_count = int(len(VN100_TICKERS) * 0.2)
     top_20_tickers = {x[0] for x in rs_results[:top_20_count]}
-    rs_map = {x[0]: x[1] for x in rs_results}
+    
+    # Map kết quả RS và Momentum
+    rs_map = {x[0]: (x[1], x[2]) for x in rs_results}
+    
+    # Bước mới: Tính điểm Sóng ngành
+    sector_rs_map = calculate_sector_rs(rs_map)
+    
+    # Xử lý dữ liệu Top 3 Ngành dẫn dắt
+    sorted_sectors = sorted(sector_rs_map.items(), key=lambda x: x[1], reverse=True)
+    top_3 = sorted_sectors[:3]
+    top_sectors_info = "\n".join([f"  🏆 {name}: RS {score:.2f}" for name, score in top_3])
     
     results = []
     for t in VN100_TICKERS:
         if t not in top_20_tickers: continue
         log("SCAN", f"Đang phân tích {t}...")
-        outcome = await asyncio.to_thread(evaluate_symbol, t, "VN100", sources, rs_score=rs_map.get(t,0))
+        
+        score, momentum = rs_map.get(t, (0.0, 0.0))
+        outcome = await asyncio.to_thread(
+            evaluate_symbol, t, "VN100", sources, 
+            rs_score=score, 
+            rs_momentum=momentum,
+            is_market_downtrend=is_market_downtrend,
+            sector_rs_map=sector_rs_map
+        )
         if outcome.signal: results.append(outcome.signal)
         await asyncio.sleep(1.2)
         
+    # Gửi báo cáo cuối cùng bao gồm tình hình thị trường và top ngành
+    msg = format_telegram_message(results, len(VN100_TICKERS), "VN100", market_info=market_msg, top_sectors_info=top_sectors_info)
+    await send_telegram_message(token, chat_id, msg)
     if results:
-        msg = format_telegram_message(results, len(VN100_TICKERS), "VN100")
-        await send_telegram_message(token, chat_id, msg)
         log("INFO", f"Gửi {len(results)} tín hiệu thành công.")
     else:
         log("INFO", "Không tìm thấy mã đạt tiêu chuẩn.")
