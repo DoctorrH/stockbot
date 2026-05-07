@@ -2,6 +2,7 @@ import asyncio
 import os
 import io
 import sys
+import html
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
@@ -321,7 +322,7 @@ def evaluate_symbol(symbol: str, exchange: str, sources: List[str], length: int 
         if sector_rs >= 1.05:
             recommended_size = "ĐÁNH LỚN (30-50%) - Có sóng ngành bảo kê"
         else:
-            recommended_size = "ĐÁNH NHỎ (<15%) - Đi ngược bầy đàn, rủi ro T+"
+            recommended_size = "ĐÁNH NHỎ (Dưới 15%) - Đi ngược bầy đàn, rủi ro T+"
 
     if not label: label, priority = "👀 THEO DÕI THÊM", 4
     
@@ -370,14 +371,20 @@ def format_telegram_message(results: List[SignalResult], scanned: int, source: s
             emoji = "🚀" if r.priority_level == 1 else ("💎" if r.priority_level == 2 else "⚠️")
             strategy = STRATEGY_MAP.get(r.special_label, "Quan sát rủi ro, không mở vị thế mua mới.")
             
+            # Thoát ký tự HTML cho các chuỗi văn bản để tránh lỗi parse Telegram
+            safe_label = html.escape(r.special_label)
+            safe_trend = html.escape(r.trend_type)
+            safe_size = html.escape(r.recommended_size)
+            safe_strategy = html.escape(strategy)
+            
             msg = (
-                f"{emoji} <b>{r.symbol}</b> ({r.sector_name}) | {r.special_label}\n"
+                f"{emoji} <b>{r.symbol}</b> ({html.escape(r.sector_name)}) | {safe_label}\n"
                 f"───────────────────\n"
                 f"💰 Giá: <b>{r.close:,.2f}</b> ({r.pct_change:+.2f}%)\n"
                 f"📊 RS Mã: <b>{r.rs_score:.2f}</b> | RVOL: <b>{r.rvol:.2f}</b>\n"
-                f"📍 Cách MA20: <b>{r.ma20_distance_pct:+.2f}%</b> | Cấu trúc: <b>{r.trend_type}</b>\n"
-                f"⚖️ Tỷ trọng: <b>{r.recommended_size}</b>\n"
-                f"💡 Hành động: <b>{strategy}</b>\n"
+                f"📍 Cách MA20: <b>{r.ma20_distance_pct:+.2f}%</b> | Cấu trúc: <b>{safe_trend}</b>\n"
+                f"⚖️ Tỷ trọng: <b>{safe_size}</b>\n"
+                f"💡 Hành động: <b>{safe_strategy}</b>\n"
                 f"───────────────────\n"
             )
             lines.append(msg)
